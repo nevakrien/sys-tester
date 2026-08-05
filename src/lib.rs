@@ -355,24 +355,24 @@ impl TaskInfo {
             .iter()
             .map(|&atom| atoms[atom as usize])
             .collect();
-        let graph = VecGraph::from_adjacency_lists(
+        let after_graph = VecGraph::from_adjacency_lists(
             atom_order
                 .order
                 .iter()
                 .map(|&from| reduced.edges(from).map(|to| atom_order.map[to])),
         );
-        let mut reverse_edges = vec![Vec::new(); graph.num_nodes()];
-        for from in graph.iter_nodes() {
-            for to in graph.edges(from) {
-                reverse_edges[to.index()].push(from);
+        let mut before_edges = vec![Vec::new(); after_graph.num_nodes()];
+        for from in after_graph.iter_nodes() {
+            for to in after_graph.edges(from) {
+                before_edges[to.index()].push(from);
             }
         }
-        let reverse_graph = VecGraph::from_adjacency_lists(reverse_edges);
+        let before_graph = VecGraph::from_adjacency_lists(before_edges);
 
         Ok(CompiledSetup {
             atoms: ordered_atoms,
-            graph,
-            reverse_graph,
+            after_graph,
+            before_graph,
         })
     }
 }
@@ -380,8 +380,10 @@ impl TaskInfo {
 #[derive(Debug)]
 pub struct CompiledSetup {
     atoms: Vec<Atom>,
-    graph: VecGraph<u32>,
-    reverse_graph: VecGraph<u32>,
+    /// Edges lead to atoms that execute after the source atom.
+    after_graph: VecGraph<u32>,
+    /// Edges lead to atoms that execute before the source atom.
+    before_graph: VecGraph<u32>,
 }
 
 #[cfg(test)]
@@ -403,7 +405,7 @@ mod tests {
             .position(|atom| matches!(atom.data, AtomData::DebugName(name) if name == from_name))
             .unwrap() as u32;
         let mut edges: Vec<_> = work
-            .graph
+            .after_graph
             .edges(from)
             .map(|to| match work.atoms[to as usize].data {
                 AtomData::DebugName(name) => name,
@@ -510,10 +512,10 @@ mod tests {
 
         assert!(matches!(compiled.atoms[0].data, AtomData::DebugName("b")));
         assert!(matches!(compiled.atoms[1].data, AtomData::DebugName("a")));
-        assert_eq!(compiled.graph.edges(0).collect::<Vec<_>>(), vec![1]);
-        assert!(compiled.graph.edges(1).next().is_none());
-        assert!(compiled.reverse_graph.edges(0).next().is_none());
-        assert_eq!(compiled.reverse_graph.edges(1).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(compiled.after_graph.edges(0).collect::<Vec<_>>(), vec![1]);
+        assert!(compiled.after_graph.edges(1).next().is_none());
+        assert!(compiled.before_graph.edges(0).next().is_none());
+        assert_eq!(compiled.before_graph.edges(1).collect::<Vec<_>>(), vec![0]);
     }
 
     #[test]

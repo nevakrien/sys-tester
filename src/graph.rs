@@ -58,6 +58,25 @@ impl<Node: Idx> VecGraph<Node> {
         Self { nodes, edges }
     }
 
+    /// Packs owned adjacency lists into a contiguous representation.
+    pub fn from_adjacency_lists<A, E>(adjacency_lists: A) -> Self
+    where
+        A: IntoIterator<Item = E>,
+        E: IntoIterator<Item = Node>,
+    {
+        let adjacency_lists = adjacency_lists.into_iter();
+        let mut nodes = IndexVec::with_capacity(adjacency_lists.size_hint().0);
+        let mut edges = Vec::new();
+
+        for adjacency_list in adjacency_lists {
+            let start = edges.len();
+            edges.extend(adjacency_list);
+            nodes.push(start..edges.len());
+        }
+
+        Self { nodes, edges }
+    }
+
     pub(crate) fn from_raw(nodes: IndexVec<Node, Range<usize>>, edges: Vec<Node>) -> Self {
         Self { nodes, edges }
     }

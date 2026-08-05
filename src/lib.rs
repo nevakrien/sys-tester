@@ -1,5 +1,5 @@
 use crate::graph::{
-    BasicGraph, DirectedGraph, GraphCycle, TopologicalOrder, VecGraph, topological_order,
+    DirectedGraph, GraphCycle, TopologicalOrder, VecGraph, topological_order,
     transitive_solved_reduction,
 };
 use crate::index::Idx;
@@ -278,30 +278,18 @@ impl TaskInfo {
             }
         }
 
-        let mut task_graph = BasicGraph {
-            edges: task_edges
-                .iter()
-                .map(|destinations| {
-                    let mut destinations: Vec<_> = destinations.iter().copied().collect();
-
-                    destinations.sort_unstable();
-                    destinations
-                })
-                .collect(),
-        };
-
         /*
          * Follow each task edge through empty tasks to the next nonempty
          * boundary. This contracts empty paths without requiring an order.
          */
-        for from in task_graph.iter_nodes() {
+        for from in 0..self.tasks.len() as u32 {
             let source = boundaries[from.index()].as_ref().unwrap();
             if source.entries.is_empty() {
                 continue;
             }
 
             let mut seen = vec![false; self.tasks.len()];
-            let mut stack: Vec<_> = task_graph.edges(from).collect();
+            let mut stack: Vec<_> = task_edges[from.index()].iter().copied().collect();
             while let Some(to) = stack.pop() {
                 if seen[to.index()] {
                     continue;
@@ -310,7 +298,7 @@ impl TaskInfo {
 
                 let destination = boundaries[to.index()].as_ref().unwrap();
                 if destination.entries.is_empty() {
-                    stack.extend(task_graph.edges(to));
+                    stack.extend(task_edges[to.index()].iter().copied());
                 } else {
                     connect(&mut atom_edges, &source.exits, &destination.entries);
                 }
@@ -325,15 +313,18 @@ impl TaskInfo {
             .collect();
         for (from, destinations) in atom_edges.iter().enumerate() {
             let from_task = atom_tasks[from];
-            task_graph.edges[from_task].extend(destinations.iter().filter_map(|&to| {
+            task_edges[from_task.index()].extend(destinations.iter().filter_map(|&to| {
                 let to_task = atom_tasks[to as usize];
                 (from_task != to_task).then_some(to_task)
             }));
         }
-        for task in 0..self.tasks.len() as u32 {
-            task_graph.edges[task].sort_unstable();
-            task_graph.edges[task].dedup();
-        }
+
+        let task_graph =
+            VecGraph::from_adjacency_lists(task_edges.into_iter().map(|destinations| {
+                let mut destinations: Vec<_> = destinations.into_iter().collect();
+                destinations.sort_unstable();
+                destinations
+            }));
 
         // Atom tasks are now a subgraph, so their subsequence is already a
         // valid topological order for transitive reduction.
@@ -343,16 +334,12 @@ impl TaskInfo {
          * The atom tasks retain the topological order already computed for
          * the full task graph, so reduction does not need another DFS.
          */
-        let atom_graph = BasicGraph {
-            edges: atom_edges
-                .into_iter()
-                .map(|destinations| {
-                    let mut destinations: Vec<_> = destinations.into_iter().collect();
-                    destinations.sort_unstable();
-                    destinations
-                })
-                .collect(),
-        };
+        let atom_graph =
+            VecGraph::from_adjacency_lists(atom_edges.into_iter().map(|destinations| {
+                let mut destinations: Vec<_> = destinations.into_iter().collect();
+                destinations.sort_unstable();
+                destinations
+            }));
 
         let atom_order: Vec<u32> = task_order
             .order
@@ -376,17 +363,16 @@ impl TaskInfo {
             .iter()
             .map(|&atom| atoms[atom as usize])
             .collect();
-        let mut reordered = BasicGraph {
-            edges: (0..atoms.len()).map(|_| Vec::new()).collect(),
-        };
-        for from in atom_graph.iter_nodes() {
-            reordered.edges[atom_order.map[from]] =
-                reduced.edges(from).map(|to| atom_order.map[to]).collect();
-        }
+        let graph = VecGraph::from_adjacency_lists(
+            atom_order
+                .order
+                .iter()
+                .map(|&from| reduced.edges(from).map(|to| atom_order.map[to])),
+        );
 
         Ok(CompiledSetup {
             atoms: ordered_atoms,
-            graph: VecGraph::from_graph(&reordered),
+            graph,
         })
     }
 }

@@ -8,6 +8,7 @@ use foldhash::HashSetExt;
 pub mod buffer;
 pub mod graph;
 pub mod index;
+pub mod seccomp_test;
 
 use foldhash::HashMap;
 use std::num::NonZero;

@@ -381,7 +381,7 @@ pub fn topological_order<G: DirectedGraph>(
         });
 
         'recurse: while let Some(frame) = call_stack.last_mut() {
-            while let Some(next) = frame.edges.next() {
+            for next in frame.edges.by_ref() {
                 match states[next] {
                     DagVisitState::NotSeen => {
                         states[next] = DagVisitState::Working;
@@ -474,9 +474,11 @@ pub fn transitive_solved_reduction<G: DirectedGraph>(
 }
 
 /// Returns a new graph with transitively redundant edges removed.
+pub type TransitiveReduction<Node> = (BasicGraph<Node>, TopologicalOrder<Node>);
+
 pub fn transitive_reduction<G: DirectedGraph>(
     graph: &G,
-) -> Result<(BasicGraph<G::Node>, TopologicalOrder<G::Node>), GraphCycle<G::Node>> {
+) -> Result<TransitiveReduction<G::Node>, GraphCycle<G::Node>> {
     let topo = topological_order(graph)?;
     let reduced = transitive_solved_reduction(graph, &topo);
     Ok((reduced, topo))

@@ -462,6 +462,10 @@ impl<I: Idx> UnionFind<I> {
         self.0.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn push_singleton(&mut self) -> I {
         let id = self.0.next_index();
         self.0.push(id);

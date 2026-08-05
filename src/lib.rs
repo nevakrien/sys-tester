@@ -63,6 +63,14 @@ impl TaskInfo {
             Done,
         }
 
+        struct BoundaryBuild<'a> {
+            boundaries: &'a mut [Option<Boundary>],
+            states: &'a mut [State],
+            stack: &'a mut Vec<u32>,
+            stack_positions: &'a mut [usize],
+            atom_edges: &'a mut [HashSet<u32>],
+        }
+
         /// Adds every edge from `exits` to every node in `entries`.
         fn connect(edges: &mut [HashSet<u32>], exits: &[u32], entries: &[u32]) {
             for &from in exits {
@@ -95,33 +103,29 @@ impl TaskInfo {
             task_idx: u32,
             tasks: &[Task],
             atoms_map: &[u32],
-            boundaries: &mut [Option<Boundary>],
-            states: &mut [State],
-            stack: &mut Vec<u32>,
-            stack_positions: &mut [usize],
-            atom_edges: &mut [HashSet<u32>],
+            build: &mut BoundaryBuild<'_>,
         ) -> Result<Boundary, GraphCycle<u32>> {
             let idx = task_idx as usize;
 
-            match states[idx] {
+            match build.states[idx] {
                 State::OnStack => {
-                    let start = stack_positions[idx];
-                    let mut nodes = stack[start..].to_vec();
+                    let start = build.stack_positions[idx];
+                    let mut nodes = build.stack[start..].to_vec();
                     nodes.push(task_idx);
 
                     return Err(GraphCycle { nodes });
                 }
 
                 State::Done => {
-                    return Ok(boundaries[idx].as_ref().unwrap().clone());
+                    return Ok(build.boundaries[idx].as_ref().unwrap().clone());
                 }
 
                 State::NotSeen => {}
             }
 
-            states[idx] = State::OnStack;
-            stack_positions[idx] = stack.len();
-            stack.push(task_idx);
+            build.states[idx] = State::OnStack;
+            build.stack_positions[idx] = build.stack.len();
+            build.stack.push(task_idx);
 
             let boundary = match &tasks[idx] {
                 Task::Atom(_) => {
@@ -138,16 +142,7 @@ impl TaskInfo {
                     let mut exits = Vec::new();
 
                     for &child_idx in children {
-                        let child = build_boundary(
-                            child_idx,
-                            tasks,
-                            atoms_map,
-                            boundaries,
-                            states,
-                            stack,
-                            stack_positions,
-                            atom_edges,
-                        )?;
+                        let child = build_boundary(child_idx, tasks, atoms_map, build)?;
 
                         entries.extend(child.entries);
                         exits.extend(child.exits);
@@ -164,16 +159,7 @@ impl TaskInfo {
                     let mut previous_exits: Option<Vec<u32>> = None;
 
                     for &child_idx in children {
-                        let child = build_boundary(
-                            child_idx,
-                            tasks,
-                            atoms_map,
-                            boundaries,
-                            states,
-                            stack,
-                            stack_positions,
-                            atom_edges,
-                        )?;
+                        let child = build_boundary(child_idx, tasks, atoms_map, build)?;
 
                         // Empty tasks inherit the surrounding ordering.
                         if child.entries.is_empty() {
@@ -185,7 +171,7 @@ impl TaskInfo {
                         }
 
                         if let Some(previous) = &previous_exits {
-                            connect(atom_edges, previous, &child.entries);
+                            connect(build.atom_edges, previous, &child.entries);
                         }
 
                         previous_exits = Some(child.exits);
@@ -198,9 +184,9 @@ impl TaskInfo {
                 }
             };
 
-            stack.pop();
-            states[idx] = State::Done;
-            boundaries[idx] = Some(boundary.clone());
+            build.stack.pop();
+            build.states[idx] = State::Done;
+            build.boundaries[idx] = Some(boundary.clone());
 
             Ok(boundary)
         }
@@ -221,7 +207,7 @@ impl TaskInfo {
                 Task::Atom(atom) => {
                     atoms_map.push(count);
                     count += 1;
-                    Some(atom.clone())
+                    Some(*atom)
                 }
 
                 _ => {
@@ -240,18 +226,23 @@ impl TaskInfo {
         let mut states = vec![State::NotSeen; self.tasks.len()];
         let mut stack = Vec::new();
         let mut stack_positions = vec![0; self.tasks.len()];
+        {
+            let mut boundary_build = BoundaryBuild {
+                boundaries: &mut boundaries,
+                states: &mut states,
+                stack: &mut stack,
+                stack_positions: &mut stack_positions,
+                atom_edges: &mut atom_edges,
+            };
 
-        for task_idx in 0..self.tasks.len() {
-            build_boundary(
-                task_idx as u32,
-                &self.tasks,
-                &atoms_map,
-                &mut boundaries,
-                &mut states,
-                &mut stack,
-                &mut stack_positions,
-                &mut atom_edges,
-            )?;
+            for task_idx in 0..self.tasks.len() {
+                build_boundary(
+                    task_idx as u32,
+                    &self.tasks,
+                    &atoms_map,
+                    &mut boundary_build,
+                )?;
+            }
         }
 
         /*

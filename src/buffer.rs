@@ -2,8 +2,20 @@ use std::mem::MaybeUninit;
 use std::mem::transmute;
 use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
+use std::{error, fmt};
 
 pub const MAX_PATH: usize = libc::PATH_MAX as usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathTooLong;
+
+impl fmt::Display for PathTooLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("path exceeds PATH_MAX")
+    }
+}
+
+impl error::Error for PathTooLong {}
 
 ///rust is being anoying this SHOULD be PATH_MAX
 #[repr(C, align(4096))]
@@ -17,7 +29,7 @@ const _: () = assert!(size_of::<Buffer>() == MAX_PATH);
 const _: () = assert!(align_of::<Buffer>() == MAX_PATH);
 
 /// A constant size buffer for writing paths into
-/// this is 
+/// this is
 pub struct PathBuffer {
     buf: Box<Buffer>,
     len: usize,
@@ -47,9 +59,9 @@ impl PathBuffer {
         self.truncate(0);
     }
 
-    pub fn set_slice(&mut self, s: &[u8]) -> Result<(), ()> {
+    pub fn set_slice(&mut self, s: &[u8]) -> Result<(), PathTooLong> {
         if s.len() > MAX_PATH {
-            return Err(());
+            return Err(PathTooLong);
         }
 
         unsafe {
@@ -61,8 +73,10 @@ impl PathBuffer {
         Ok(())
     }
 
-    ///SAFETY: must return a len upto it the buffer is valid.
-    /// may not write more than MAX_PATH
+    /// # Safety
+    ///
+    /// The closure must initialize every byte before the returned length and
+    /// must neither write nor return a length greater than [`MAX_PATH`].
     pub unsafe fn write_some(&mut self, f: impl FnOnce(*mut u8) -> usize) {
         self.clear();
         let r = &raw mut self.buf.bytes;
@@ -70,7 +84,7 @@ impl PathBuffer {
     }
 
     pub fn chop_by_null(&mut self) {
-        for (i, b) in (&*self).iter().enumerate() {
+        for (i, b) in self.iter().enumerate() {
             if *b == 0 {
                 self.truncate(i);
                 return;
@@ -107,7 +121,7 @@ mod tests {
         buffer.clear();
         assert!(buffer.is_empty());
 
-        assert_eq!(buffer.set_slice(&[0; MAX_PATH + 1]), Err(()));
+        assert_eq!(buffer.set_slice(&[0; MAX_PATH + 1]), Err(PathTooLong));
         assert!(buffer.is_empty());
     }
 }

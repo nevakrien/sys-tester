@@ -1,117 +1,42 @@
 use std::io;
 use std::os::fd::RawFd;
-use std::ptr::NonNull;
 
-use libseccomp_sys::{
-    scmp_filter_ctx,
-    seccomp_init,
-    seccomp_load,
-    seccomp_notify_fd,
-    seccomp_release,
-    seccomp_rule_add_array,
-    SCMP_ACT_ALLOW,
-    SCMP_ACT_KILL_PROCESS,
-    SCMP_ACT_NOTIFY,
-};
+use crate::seccomp_filters::X86_64_FINAL;
 
-pub struct FilterContext {
-    ptr: NonNull<std::ffi::c_void>,
-}
-
-impl FilterContext {
-    pub fn new(default_action: u32) -> io::Result<Self> {
-        let ptr = unsafe { seccomp_init(default_action) };
-
-        let ptr = NonNull::new(ptr)
-            .ok_or_else(|| io::Error::other("seccomp_init failed"))?;
-
-        Ok(Self { ptr })
-    }
-
-    pub fn as_raw(&self) -> scmp_filter_ctx {
-        self.ptr.as_ptr()
-    }
-
-    pub fn add_rule(&mut self, syscall: libc::c_long, action: u32) -> io::Result<()> {
-        // Use the array form because Rust cannot conveniently call the
-        // variadic seccomp_rule_add() function.
-        let result = unsafe {
-            seccomp_rule_add_array(
-                self.as_raw(),
-                action,
-                syscall as libc::c_int,
-                0,
-                std::ptr::null(),
-            )
-        };
-
-        seccomp_result(result)
-    }
-
-    pub fn load(&mut self) -> io::Result<()> {
-        let result = unsafe { seccomp_load(self.as_raw()) };
-        seccomp_result(result)
-    }
-
-    pub fn notify_fd(&self) -> io::Result<RawFd> {
-        let fd = unsafe { seccomp_notify_fd(self.as_raw()) };
-
-        if fd < 0 {
-            Err(io::Error::from_raw_os_error(-fd))
-        } else {
-            Ok(fd)
-        }
-    }
-}
-
-impl Drop for FilterContext {
-    fn drop(&mut self) {
-        unsafe {
-            seccomp_release(self.as_raw());
-        }
-    }
-}
-
-/// Libseccomp returns zero for success and negative errno values for failure.
-fn seccomp_result(result: libc::c_int) -> io::Result<()> {
-    if result < 0 {
-        Err(io::Error::from_raw_os_error(-result))
-    } else {
-        Ok(())
-    }
-}
-
-/// Install this filter:
+/// Installs the build-generated final filter and returns its notification listener.
 ///
-/// - open/openat/openat2/read/write/close -> USER_NOTIF
-/// - exit/exit_group                     -> ALLOW
-/// - everything else                    -> KILL_PROCESS
-pub fn install_seccomp_filter() -> io::Result<(FilterContext, RawFd)> {
-    let mut filter = FilterContext::new(SCMP_ACT_KILL_PROCESS)?;
+/// Filter construction belongs to the build script. This runtime path only
+/// passes generated classic BPF to the kernel and does not link libseccomp.
+pub fn install_seccomp_filter() -> io::Result<RawFd> {
+    install_filter(&X86_64_FINAL)
+}
 
-    for syscall in [
-        libc::SYS_open,
-        libc::SYS_openat,
-        libc::SYS_openat2,
-        libc::SYS_read,
-        libc::SYS_write,
-        libc::SYS_close,
-    ] {
-        filter.add_rule(syscall, SCMP_ACT_NOTIFY)?;
+fn install_filter(filter: &'static [libc::sock_filter]) -> io::Result<RawFd> {
+    let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
     }
 
-    for syscall in [
-        libc::SYS_exit,
-        libc::SYS_exit_group,
-    ] {
-        filter.add_rule(syscall, SCMP_ACT_ALLOW)?;
+    let program = libc::sock_fprog {
+        len: filter.len().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "seccomp filter is too large")
+        })?,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    let listener = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            &program,
+        )
+    };
+
+    if listener < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(listener as RawFd)
     }
-
-    filter.load()?;
-
-    let listener = filter.notify_fd()?;
-
-    Ok((filter, listener))
 }
 
 #[cfg(test)]
@@ -124,17 +49,7 @@ mod tests {
     use std::os::fd::RawFd;
     use std::ptr;
 
-    use libseccomp_sys::{
-        seccomp_notif,
-        seccomp_notif_resp,
-        seccomp_notify_alloc,
-        seccomp_notify_free,
-        seccomp_notify_receive,
-        seccomp_notify_respond,
-        SCMP_ACT_ALLOW,
-        SCMP_ACT_KILL_PROCESS,
-        SCMP_ACT_NOTIFY,
-    };
+    use crate::seccomp_filters::X86_64_BOOTSTRAP;
 
     // =========================================================================
     // Small general-purpose FD wrapper
@@ -176,51 +91,22 @@ mod tests {
     // Notification request/response allocation
     // =========================================================================
 
-    /// Owns the correctly sized libseccomp notification buffers.
-    ///
-    /// These must be allocated through seccomp_notify_alloc(). Stack-allocating
-    /// `seccomp_notif` directly can produce EOPNOTSUPP because the structure
-    /// size expected by the running kernel may differ from the Rust binding.
     struct NotificationBuffers {
-        request: *mut seccomp_notif,
-        response: *mut seccomp_notif_resp,
+        request: libc::seccomp_notif,
+        response: libc::seccomp_notif_resp,
     }
 
     impl NotificationBuffers {
         fn new() -> io::Result<Self> {
-            let mut request = ptr::null_mut();
-            let mut response = ptr::null_mut();
-
-            let result = unsafe {
-                seccomp_notify_alloc(&mut request, &mut response)
-            };
-
-            check_libseccomp(result)?;
-
-            if request.is_null() || response.is_null() {
-                unsafe {
-                    seccomp_notify_free(request, response);
-                }
-
-                return Err(io::Error::other(
-                    "seccomp_notify_alloc returned a null pointer",
-                ));
-            }
-
-            Ok(Self {
-                request,
-                response,
-            })
+            Ok(unsafe { zeroed() })
         }
 
-        fn receive(&mut self, listener: RawFd) -> io::Result<&seccomp_notif> {
-            let result = unsafe {
-                seccomp_notify_receive(listener, self.request)
-            };
-
-            check_libseccomp(result)?;
-
-            Ok(unsafe { &*self.request })
+        fn receive(&mut self, listener: RawFd) -> io::Result<&libc::seccomp_notif> {
+            self.request = unsafe { zeroed() };
+            let result =
+                unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_RECV, &mut self.request) };
+            check_syscall(result)?;
+            Ok(&self.request)
         }
 
         fn respond_errno(
@@ -229,32 +115,20 @@ mod tests {
             notification_id: u64,
             errno: libc::c_int,
         ) -> io::Result<()> {
-            let response = unsafe { &mut *self.response };
+            self.response.id = notification_id;
+            self.response.val = 0;
+            self.response.error = -errno;
+            self.response.flags = 0;
 
-            response.id = notification_id;
-            response.val = 0;
-            response.error = -errno;
-            response.flags = 0;
-
-            let result = unsafe {
-                seccomp_notify_respond(listener, self.response)
-            };
-
-            check_libseccomp(result)
+            let result =
+                unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_SEND, &self.response) };
+            check_syscall(result)
         }
     }
 
-    impl Drop for NotificationBuffers {
-        fn drop(&mut self) {
-            unsafe {
-                seccomp_notify_free(self.request, self.response);
-            }
-        }
-    }
-
-    fn check_libseccomp(result: libc::c_int) -> io::Result<()> {
+    fn check_syscall(result: libc::c_int) -> io::Result<()> {
         if result < 0 {
-            Err(io::Error::from_raw_os_error(-result))
+            Err(io::Error::last_os_error())
         } else {
             Ok(())
         }
@@ -280,12 +154,7 @@ mod tests {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(unsafe {
-            (
-                Fd::from_raw(sockets[0]),
-                Fd::from_raw(sockets[1]),
-            )
-        })
+        Ok(unsafe { (Fd::from_raw(sockets[0]), Fd::from_raw(sockets[1])) })
     }
 
     /// Send one FD through a Unix-domain socket using SCM_RIGHTS.
@@ -310,28 +179,20 @@ mod tests {
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast::<c_void>();
         message.msg_controllen =
-            libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as usize;
+            unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as usize };
 
-        let header = unsafe {
-            libc::CMSG_FIRSTHDR(&message)
-        };
+        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
 
         if header.is_null() {
-            return Err(io::Error::other(
-                "CMSG_FIRSTHDR returned null",
-            ));
+            return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
         }
 
         unsafe {
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len =
-                libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as usize;
+            (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as usize;
 
-            ptr::write(
-                libc::CMSG_DATA(header).cast::<libc::c_int>(),
-                fd,
-            );
+            ptr::write(libc::CMSG_DATA(header).cast::<libc::c_int>(), fd);
         }
 
         // Call the syscall directly so the operation is unambiguous under
@@ -369,9 +230,7 @@ mod tests {
         message.msg_control = control.as_mut_ptr().cast::<c_void>();
         message.msg_controllen = control.len();
 
-        let result = unsafe {
-            libc::recvmsg(socket, &mut message, 0)
-        };
+        let result = unsafe { libc::recvmsg(socket, &mut message, 0) };
 
         if result < 0 {
             return Err(io::Error::last_os_error());
@@ -385,46 +244,29 @@ mod tests {
         }
 
         if message.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::other(
-                "SCM_RIGHTS control message was truncated",
-            ));
+            return Err(io::Error::other("SCM_RIGHTS control message was truncated"));
         }
 
-        let header = unsafe {
-            libc::CMSG_FIRSTHDR(&message)
-        };
+        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
 
         if header.is_null() {
-            return Err(io::Error::other(
-                "message contained no control data",
-            ));
+            return Err(io::Error::other("message contained no control data"));
         }
 
         let valid_header = unsafe {
             (*header).cmsg_level == libc::SOL_SOCKET
                 && (*header).cmsg_type == libc::SCM_RIGHTS
-                && (*header).cmsg_len
-                    >= libc::CMSG_LEN(
-                        size_of::<libc::c_int>() as u32,
-                    ) as usize
+                && (*header).cmsg_len >= libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as usize
         };
 
         if !valid_header {
-            return Err(io::Error::other(
-                "message did not contain an SCM_RIGHTS FD",
-            ));
+            return Err(io::Error::other("message did not contain an SCM_RIGHTS FD"));
         }
 
-        let received = unsafe {
-            ptr::read(
-                libc::CMSG_DATA(header).cast::<libc::c_int>(),
-            )
-        };
+        let received = unsafe { ptr::read(libc::CMSG_DATA(header).cast::<libc::c_int>()) };
 
         if received < 0 {
-            return Err(io::Error::other(
-                "received an invalid FD",
-            ));
+            return Err(io::Error::other("received an invalid FD"));
         }
 
         Ok(unsafe { Fd::from_raw(received) })
@@ -435,22 +277,13 @@ mod tests {
     // =========================================================================
 
     unsafe fn replace_standard_fds() -> io::Result<()> {
-        let null_fd = unsafe {
-            libc::open(
-                c"/dev/null".as_ptr(),
-                libc::O_RDWR | libc::O_CLOEXEC,
-            )
-        };
+        let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
 
         if null_fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        for target in [
-            libc::STDIN_FILENO,
-            libc::STDOUT_FILENO,
-            libc::STDERR_FILENO,
-        ] {
+        for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
             if unsafe { libc::dup2(null_fd, target) } < 0 {
                 let error = io::Error::last_os_error();
 
@@ -479,28 +312,16 @@ mod tests {
         assert!(keep >= 3);
 
         if keep > 3 {
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    3_u32,
-                    (keep - 1) as u32,
-                    0_u32,
-                )
-            };
+            let result =
+                unsafe { libc::syscall(libc::SYS_close_range, 3_u32, (keep - 1) as u32, 0_u32) };
 
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
         }
 
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                (keep + 1) as u32,
-                u32::MAX,
-                0_u32,
-            )
-        };
+        let result =
+            unsafe { libc::syscall(libc::SYS_close_range, (keep + 1) as u32, u32::MAX, 0_u32) };
 
         if result < 0 {
             return Err(io::Error::last_os_error());
@@ -513,34 +334,8 @@ mod tests {
     ///
     /// sendmsg is the sole bootstrap exception. The child needs it once to
     /// transfer the listener FD to the parent.
-    fn install_test_filter() -> io::Result<(FilterContext, RawFd)> {
-        let mut filter =
-            FilterContext::new(SCMP_ACT_KILL_PROCESS)?;
-
-        for syscall in [
-            libc::SYS_open,
-            libc::SYS_openat,
-            libc::SYS_openat2,
-            libc::SYS_read,
-            libc::SYS_write,
-            libc::SYS_close,
-        ] {
-            filter.add_rule(syscall, SCMP_ACT_NOTIFY)?;
-        }
-
-        for syscall in [
-            libc::SYS_sendmsg,
-            libc::SYS_exit,
-            libc::SYS_exit_group,
-        ] {
-            filter.add_rule(syscall, SCMP_ACT_ALLOW)?;
-        }
-
-        filter.load()?;
-
-        let listener = filter.notify_fd()?;
-
-        Ok((filter, listener))
+    fn install_test_filter() -> io::Result<RawFd> {
+        install_filter(&X86_64_BOOTSTRAP)
     }
 
     /// Exit without invoking Rust destructors or libc shutdown machinery.
@@ -558,12 +353,9 @@ mod tests {
 
     #[test]
     fn openat_is_delivered_to_parent() {
-        let (parent_socket, child_socket) =
-            socket_pair().expect("socketpair failed");
+        let (parent_socket, child_socket) = socket_pair().expect("socketpair failed");
 
-        let child_pid = unsafe {
-            libc::fork()
-        };
+        let child_pid = unsafe { libc::fork() };
 
         assert!(
             child_pid >= 0,
@@ -593,23 +385,14 @@ mod tests {
             // the restrictive filter is active.
             let path = c"/definitely/not/a/real/seccomp-test-file";
 
-            let (filter, listener) = match install_test_filter() {
+            let listener = match install_test_filter() {
                 Ok(value) => value,
                 Err(_) => unsafe {
                     child_exit(12);
                 },
             };
 
-            // The filter context owns userspace allocations. Dropping it after
-            // loading this policy might cause allocator syscalls such as
-            // munmap, so deliberately leave it allocated until process exit.
-            std::mem::forget(filter);
-
-            if unsafe {
-                send_fd(child_socket_fd, listener)
-            }
-            .is_err()
-            {
+            if unsafe { send_fd(child_socket_fd, listener) }.is_err() {
                 unsafe {
                     child_exit(13);
                 }
@@ -650,11 +433,11 @@ mod tests {
         // Parent retains only its end of the bootstrap socket.
         drop(child_socket);
 
-        let listener = receive_fd(parent_socket.raw())
-            .expect("failed to receive seccomp listener FD");
+        let listener =
+            receive_fd(parent_socket.raw()).expect("failed to receive seccomp listener FD");
 
-        let mut buffers = NotificationBuffers::new()
-            .expect("failed to allocate notification buffers");
+        let mut buffers =
+            NotificationBuffers::new().expect("failed to allocate notification buffers");
 
         let (notification_id, syscall_number, notifying_pid) = {
             let request = buffers
@@ -672,18 +455,12 @@ mod tests {
         assert_eq!(syscall_number, libc::SYS_openat);
 
         buffers
-            .respond_errno(
-                listener.raw(),
-                notification_id,
-                libc::ENOENT,
-            )
+            .respond_errno(listener.raw(), notification_id, libc::ENOENT)
             .expect("failed to respond to seccomp notification");
 
         let mut status = 0;
 
-        let waited = unsafe {
-            libc::waitpid(child_pid, &mut status, 0)
-        };
+        let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
 
         assert_eq!(
             waited,
@@ -697,10 +474,6 @@ mod tests {
             "child did not exit normally; wait status = {status:#x}",
         );
 
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "child reported test failure",
-        );
+        assert_eq!(libc::WEXITSTATUS(status), 0, "child reported test failure",);
     }
 }

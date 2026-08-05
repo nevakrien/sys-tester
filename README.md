@@ -1,6 +1,15 @@
 # sys-tester
 testing libarary made in rust relying on syscalls.
 
+## Workspace architecture
+
+`sys-tester` contains the test compiler, runner, process and FD models, seccomp
+installation and notifications, ptrace integration, and all other runtime
+behavior. Its build script uses libseccomp to compile the bootstrap and final
+policies into classic-BPF blobs under Cargo's `OUT_DIR`; no generated artifacts
+are written into the source tree. Building from a clean target directory
+therefore requires libseccomp to be installed.
+
 The general idea is to allow specifying reads and writes that need to happen, as well as other file operations.
 All code is ran in a sandbox which emulates actually writing for the most part. 
 

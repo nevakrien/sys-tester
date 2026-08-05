@@ -5,6 +5,7 @@ use crate::graph::{
 use crate::index::Idx;
 use foldhash::HashSet;
 use foldhash::HashSetExt;
+pub mod buffer;
 pub mod graph;
 pub mod index;
 
@@ -369,10 +370,18 @@ impl TaskInfo {
                 .iter()
                 .map(|&from| reduced.edges(from).map(|to| atom_order.map[to])),
         );
+        let mut reverse_edges = vec![Vec::new(); graph.num_nodes()];
+        for from in graph.iter_nodes() {
+            for to in graph.edges(from) {
+                reverse_edges[to.index()].push(from);
+            }
+        }
+        let reverse_graph = VecGraph::from_adjacency_lists(reverse_edges);
 
         Ok(CompiledSetup {
             atoms: ordered_atoms,
             graph,
+            reverse_graph,
         })
     }
 }
@@ -381,6 +390,7 @@ impl TaskInfo {
 pub struct CompiledSetup {
     atoms: Vec<Atom>,
     graph: VecGraph<u32>,
+    reverse_graph: VecGraph<u32>,
 }
 
 #[cfg(test)]
@@ -511,6 +521,8 @@ mod tests {
         assert!(matches!(compiled.atoms[1].data, AtomData::DebugName("a")));
         assert_eq!(compiled.graph.edges(0).collect::<Vec<_>>(), vec![1]);
         assert!(compiled.graph.edges(1).next().is_none());
+        assert!(compiled.reverse_graph.edges(0).next().is_none());
+        assert_eq!(compiled.reverse_graph.edges(1).collect::<Vec<_>>(), vec![0]);
     }
 
     #[test]

@@ -39,6 +39,8 @@ fn install_filter(filter: &'static [libc::sock_filter]) -> io::Result<RawFd> {
     }
 }
 
+
+#[cfg(not(miri))]//we have raw syscalls here
 #[cfg(test)]
 mod tests {
     use super::*;

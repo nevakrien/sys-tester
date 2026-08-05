@@ -510,11 +510,11 @@ impl<I: Idx> UnionFind<I> {
         (map, cluster_count)
     }
 
-    pub fn from_raw(raw:IndexVec<I, I>)->Self{
+    pub fn from_raw(raw: IndexVec<I, I>) -> Self {
         Self(raw)
     }
 
-    pub fn to_raw(self)->IndexVec<I,I>{
+    pub fn to_raw(self) -> IndexVec<I, I> {
         self.0
     }
 }
@@ -560,9 +560,6 @@ mod tests {
     fn union_find_cluster_map_handles_empty_input() {
         let mut union_find = UnionFind::<u32>::new();
 
-        assert_eq!(
-            union_find.cluster_map(),
-            (IndexVec::<u32, u32>::new(), 0)
-        );
+        assert_eq!(union_find.cluster_map(), (IndexVec::<u32, u32>::new(), 0));
     }
 }

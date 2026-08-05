@@ -340,13 +340,10 @@ struct DagWorkFrame<Node: Idx, I: Iterator<Item = Node>> {
 pub fn topological_order<G: DirectedGraph>(
     graph: &G,
 ) -> Result<TopologicalOrder<G::Node>, GraphCycle<G::Node>> {
-    let mut states: IndexVec<G::Node, DagVisitState> = graph
-        .iter_nodes()
-        .map(|_| DagVisitState::NotSeen)
-        .collect();
+    let mut states: IndexVec<G::Node, DagVisitState> =
+        graph.iter_nodes().map(|_| DagVisitState::NotSeen).collect();
 
-    let mut stack_pos: IndexVec<G::Node, usize> =
-        graph.iter_nodes().map(|_| usize::MAX).collect();
+    let mut stack_pos: IndexVec<G::Node, usize> = graph.iter_nodes().map(|_| usize::MAX).collect();
 
     let mut call_stack = Vec::new();
     let mut reverse_order = Vec::with_capacity(graph.num_nodes());
@@ -382,10 +379,8 @@ pub fn topological_order<G: DirectedGraph>(
                     DagVisitState::Working => {
                         let start = stack_pos[next];
 
-                        let mut cycle: Vec<_> = call_stack[start..]
-                            .iter()
-                            .map(|frame| frame.node)
-                            .collect();
+                        let mut cycle: Vec<_> =
+                            call_stack[start..].iter().map(|frame| frame.node).collect();
 
                         cycle.push(next);
                         return Err(GraphCycle { nodes: cycle });
@@ -417,11 +412,10 @@ pub fn topological_order<G: DirectedGraph>(
     })
 }
 
-/// Returns a new graph with transitively redundant edges removed.
-pub fn transitive_reduction<G: DirectedGraph>(
+pub fn transitive_solved_reduction<G: DirectedGraph>(
     graph: &G,
-) -> Result<(BasicGraph<G::Node>, TopologicalOrder<G::Node>), GraphCycle<G::Node>> {
-    let topo = topological_order(graph)?;
+    topo: &TopologicalOrder<G::Node>,
+) -> BasicGraph<G::Node> {
     let node_count = graph.num_nodes();
 
     let mut reachable: IndexVec<G::Node, Vec<bool>> = graph
@@ -457,6 +451,15 @@ pub fn transitive_reduction<G: DirectedGraph>(
         reachable[from] = covered;
     }
 
+    reduced
+}
+
+/// Returns a new graph with transitively redundant edges removed.
+pub fn transitive_reduction<G: DirectedGraph>(
+    graph: &G,
+) -> Result<(BasicGraph<G::Node>, TopologicalOrder<G::Node>), GraphCycle<G::Node>> {
+    let topo = topological_order(graph)?;
+    let reduced = transitive_solved_reduction(graph, &topo);
     Ok((reduced, topo))
 }
 
@@ -760,12 +763,7 @@ mod tests {
 
     #[test]
     fn finds_cycle() {
-        let g = graph(4, &[
-            (0, 1),
-            (1, 2),
-            (2, 3),
-            (3, 1),
-        ]);
+        let g = graph(4, &[(0, 1), (1, 2), (2, 3), (3, 1)]);
 
         let cycle = topological_order(&g).unwrap_err();
 
@@ -774,15 +772,7 @@ mod tests {
 
     #[test]
     fn removes_transitive_edges() {
-        let g = graph(4, &[
-            (0, 1),
-            (1, 2),
-            (2, 3),
-
-            (0, 2),
-            (0, 3),
-            (1, 3),
-        ]);
+        let g = graph(4, &[(0, 1), (1, 2), (2, 3), (0, 2), (0, 3), (1, 3)]);
 
         let (reduced, topo) = transitive_reduction(&g).unwrap();
 

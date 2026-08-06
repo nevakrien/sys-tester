@@ -1,5 +1,5 @@
-use std::mem::MaybeUninit;
 use std::mem::transmute;
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::ptr::copy_nonoverlapping;
 use std::{error, fmt, io};
@@ -16,6 +16,32 @@ impl fmt::Display for PathTooLong {
 }
 
 impl error::Error for PathTooLong {}
+
+#[derive(Debug)]
+pub enum ProcessCopyError {
+    /// The supervised process supplied invalid syscall arguments.
+    Errno(libc::c_int),
+    /// Copying failed for a reason not attributable to those arguments.
+    Io(io::Error),
+}
+
+impl fmt::Display for ProcessCopyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Errno(errno) => io::Error::from_raw_os_error(*errno).fmt(f),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl error::Error for ProcessCopyError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Errno(_) => None,
+            Self::Io(error) => Some(error),
+        }
+    }
+}
 
 #[repr(C, align(4096))]
 struct Page {
@@ -121,9 +147,9 @@ impl PageBuffer {
         pid: libc::pid_t,
         address: u64,
         len: usize,
-    ) -> io::Result<&[u8]> {
+    ) -> Result<&[u8], ProcessCopyError> {
         if len > MAX_PATH {
-            return Err(path_too_long());
+            return Err(ProcessCopyError::Errno(libc::ENAMETOOLONG));
         }
 
         let mut result = Ok(());
@@ -144,14 +170,9 @@ impl PageBuffer {
         &mut self,
         pid: libc::pid_t,
         address: u64,
-    ) -> io::Result<&[u8]> {
-        self.copy_from_process_path_with_len(pid, address, MAX_PATH)?;
-        self.truncate_at_nul();
-
-        if self.len == MAX_PATH {
-            return Err(path_too_long());
-        }
-
+    ) -> Result<&[u8], ProcessCopyError> {
+        self.clear();
+        self.len = unsafe { read_process_c_path(pid, address, self.as_mut_ptr())? };
         Ok(self)
     }
 
@@ -161,7 +182,7 @@ impl PageBuffer {
         pid: libc::pid_t,
         address: u64,
         len: usize,
-    ) -> io::Result<&[u8]> {
+    ) -> Result<&[u8], ProcessCopyError> {
         let mut result = Ok(());
         unsafe {
             self.write_bytes_with(len, |destination| {
@@ -226,7 +247,7 @@ fn copy_process_memory(
     address: u64,
     destination: *mut u8,
     len: usize,
-    result: &mut io::Result<()>,
+    result: &mut Result<(), ProcessCopyError>,
 ) -> usize {
     match unsafe { read_process_memory(pid, address, destination, len) } {
         Ok(read) => read,
@@ -242,7 +263,7 @@ unsafe fn read_process_memory(
     address: u64,
     destination: *mut u8,
     len: usize,
-) -> io::Result<usize> {
+) -> Result<usize, ProcessCopyError> {
     let mut copied = 0;
 
     while copied < len {
@@ -255,18 +276,46 @@ unsafe fn read_process_memory(
     Ok(copied)
 }
 
+unsafe fn read_process_c_path(
+    pid: libc::pid_t,
+    address: u64,
+    destination: *mut u8,
+) -> Result<usize, ProcessCopyError> {
+    let mut copied = 0;
+
+    while copied < MAX_PATH {
+        let remote_address = usize::try_from(address)
+            .ok()
+            .and_then(|address| address.checked_add(copied))
+            .ok_or(ProcessCopyError::Errno(libc::EFAULT))?;
+        let page_remaining = MAX_PATH - remote_address % MAX_PATH;
+        let len = page_remaining.min(MAX_PATH - copied);
+        let read = unsafe {
+            read_process_memory_once(pid, address, destination.add(copied), copied, len)?
+        };
+        let bytes = unsafe { std::slice::from_raw_parts(destination.add(copied), read) };
+
+        if let Some(nul) = bytes.iter().position(|&byte| byte == 0) {
+            return Ok(copied + nul);
+        }
+        copied += read;
+    }
+
+    Err(ProcessCopyError::Errno(libc::ENAMETOOLONG))
+}
+
 unsafe fn read_process_memory_once(
     pid: libc::pid_t,
     address: u64,
     destination: *mut u8,
     offset: usize,
     len: usize,
-) -> io::Result<usize> {
+) -> Result<usize, ProcessCopyError> {
     let remote_address = usize::try_from(address)
         .ok()
         .and_then(|address| address.checked_add(offset))
         .filter(|address| address.checked_add(len).is_some())
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?;
+        .ok_or(ProcessCopyError::Errno(libc::EFAULT))?;
     let local = libc::iovec {
         iov_base: destination.cast(),
         iov_len: len,
@@ -278,19 +327,20 @@ unsafe fn read_process_memory_once(
     let read = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
 
     if read < 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EFAULT) {
+            Err(ProcessCopyError::Errno(libc::EFAULT))
+        } else {
+            Err(ProcessCopyError::Io(error))
+        }
     } else if read == 0 && len != 0 {
-        Err(io::Error::new(
+        Err(ProcessCopyError::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "process_vm_readv copied no data",
-        ))
+        )))
     } else {
         Ok(read as usize)
     }
-}
-
-fn path_too_long() -> io::Error {
-    io::Error::from_raw_os_error(libc::ENAMETOOLONG)
 }
 
 fn allocate_pages(count: usize) -> Box<[Page]> {
@@ -396,7 +446,7 @@ mod tests {
                 .copy_from_process_path_with_len(unsafe { libc::getpid() }, 0, MAX_PATH + 1)
                 .unwrap_err();
 
-            assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+            assert!(matches!(error, ProcessCopyError::Errno(libc::ENAMETOOLONG)));
         }
 
         #[test]
@@ -419,7 +469,91 @@ mod tests {
                 .copy_from_process_c_path(unsafe { libc::getpid() }, path.as_ptr() as u64)
                 .unwrap_err();
 
-            assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+            assert!(matches!(error, ProcessCopyError::Errno(libc::ENAMETOOLONG)));
+        }
+
+        #[test]
+        fn reports_an_invalid_remote_address_as_caller_errno() {
+            let mut buffer = PageBuffer::new();
+            let error = buffer
+                .copy_from_process_bytes(unsafe { libc::getpid() }, 0, 1)
+                .unwrap_err();
+
+            assert!(matches!(error, ProcessCopyError::Errno(libc::EFAULT)));
+        }
+
+        #[test]
+        fn c_path_stops_before_the_next_unmapped_page() {
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    MAX_PATH * 2,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+
+            let second_page = unsafe { mapping.cast::<u8>().add(MAX_PATH) };
+            let path = b"path\0";
+            let address = unsafe { second_page.sub(path.len()) };
+            unsafe {
+                copy_nonoverlapping(path.as_ptr(), address, path.len());
+                assert_eq!(libc::munmap(second_page.cast(), MAX_PATH), 0);
+            }
+
+            let mut buffer = PageBuffer::new();
+            let result = buffer.copy_from_process_c_path(unsafe { libc::getpid() }, address as u64);
+            let unmap_result = unsafe { libc::munmap(mapping, MAX_PATH) };
+
+            assert_eq!(unmap_result, 0);
+            assert_eq!(result.unwrap(), b"path");
+        }
+
+        #[test]
+        fn c_path_reports_an_unmapped_page_before_its_terminator() {
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    MAX_PATH * 2,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED);
+
+            let second_page = unsafe { mapping.cast::<u8>().add(MAX_PATH) };
+            unsafe {
+                second_page.sub(4).write_bytes(b'x', 4);
+                assert_eq!(libc::munmap(second_page.cast(), MAX_PATH), 0);
+            }
+
+            let mut buffer = PageBuffer::new();
+            let error = buffer
+                .copy_from_process_c_path(unsafe { libc::getpid() }, unsafe { second_page.sub(4) }
+                    as u64)
+                .unwrap_err();
+            let unmap_result = unsafe { libc::munmap(mapping, MAX_PATH) };
+
+            assert_eq!(unmap_result, 0);
+            assert!(matches!(error, ProcessCopyError::Errno(libc::EFAULT)));
+        }
+
+        #[test]
+        fn preserves_unrelated_kernel_failures_as_io_errors() {
+            let mut buffer = PageBuffer::new();
+            let byte = 0_u8;
+            let error = buffer
+                .copy_from_process_bytes(-1, &byte as *const u8 as u64, 1)
+                .unwrap_err();
+
+            assert!(
+                matches!(error, ProcessCopyError::Io(error) if error.raw_os_error() == Some(libc::ESRCH))
+            );
         }
 
         #[test]

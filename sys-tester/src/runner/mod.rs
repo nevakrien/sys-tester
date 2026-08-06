@@ -34,10 +34,25 @@ pub enum AtomReq {
 }
 
 impl AtomReq {
-	/// for sure wrong signature we need to figure how badly
-	pub fn new(_a:&AtomData)->Self{
-		todo!()
-	}
+    pub fn new(atom: &AtomData) -> Option<Self> {
+        Some(match *atom {
+            AtomData::Open(path) => AtomReq::Open(path),
+
+            AtomData::Read(open, _expected, size) => {
+                AtomReq::Read(MockFd(open), size)
+            }
+
+            AtomData::Write(open, text, _size) => {
+                AtomReq::Write(MockFd(open), text)
+            }
+
+            AtomData::Close(open) => {
+                AtomReq::Close(MockFd(open))
+            }
+
+            AtomData::DebugName(_) => return None,
+        })
+    }
 }
 
 pub trait ProcFileSpace {
@@ -69,7 +84,9 @@ impl<PF: ProcFileSpace> Supervisor<PF> {
 				continue;
 			}
 			
-			let req  = AtomReq::new(&info.atoms[id].data);//todo
+			let Some(req)  = AtomReq::new(&info.atoms[id].data) else {
+				todo!("handle logs")
+			};
 			ready_atoms.entry(req).or_default().push(id as u32);
 		}
 
@@ -88,7 +105,9 @@ impl<PF: ProcFileSpace> Supervisor<PF> {
 
 			self.wait_counts[x]-=1;
 			if self.wait_counts[x] == 0 {
-				let req  = AtomReq::new(&self.info.atoms[x as usize].data);//todo
+				let Some(req)  = AtomReq::new(&self.info.atoms[x as usize].data) else {
+					todo!("handle logs")
+				};
 				self.ready_atoms.entry(req).or_default().push(x);
 			}
 		}

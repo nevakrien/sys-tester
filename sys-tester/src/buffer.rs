@@ -1,8 +1,8 @@
 use std::mem::MaybeUninit;
 use std::mem::transmute;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::ptr::copy_nonoverlapping;
-use std::{error, fmt};
+use std::{error, fmt, io};
 
 pub const MAX_PATH: usize = libc::PATH_MAX as usize;
 
@@ -17,80 +17,286 @@ impl fmt::Display for PathTooLong {
 
 impl error::Error for PathTooLong {}
 
-///rust is being anoying this SHOULD be PATH_MAX
 #[repr(C, align(4096))]
-struct Buffer {
+struct Page {
     bytes: [MaybeUninit<u8>; MAX_PATH],
 }
 
-// Verify that Buffer is naturally aligned
-// this means it is for sure on minimal pages it can be (for pages 4096 or more its on 1 page)
-const _: () = assert!(size_of::<Buffer>() == MAX_PATH);
-const _: () = assert!(align_of::<Buffer>() == MAX_PATH);
+// This buffer is specifically for platforms where PATH_MAX is one page.
+const _: () = assert!(size_of::<Page>() == MAX_PATH);
+const _: () = assert!(align_of::<Page>() == MAX_PATH);
 
-/// A constant size buffer for writing paths into
-/// this is
-pub struct PathBuffer {
-    buf: Box<Buffer>,
+/// Page-aligned scratch storage that always owns at least one `PATH_MAX` page.
+///
+/// Path operations are restricted to the first page. General byte operations
+/// grow the allocation in whole pages as needed.
+pub struct PageBuffer {
+    pages: Box<[Page]>,
     len: usize,
 }
 
-impl Deref for PathBuffer {
-    type Target = [u8];
-    fn deref<'a>(&'a self) -> &'a [u8] {
-        let r: &'a [_] = &self.buf.bytes[..self.len];
-        unsafe { transmute(r) }
+impl Default for PageBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl PathBuffer {
-    pub fn truncate(&mut self, l: usize) {
-        if l >= self.len {
+impl Deref for PageBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for PageBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len) }
+    }
+}
+
+impl PageBuffer {
+    pub fn new() -> Self {
+        Self {
+            pages: allocate_pages(1),
+            len: 0,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.pages.len() * MAX_PATH
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.pages.as_ptr().cast()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.pages.as_mut_ptr().cast()
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
             return;
         }
 
-        for b in self.buf.bytes[l..].iter_mut() {
-            *b = MaybeUninit::uninit();
+        unsafe {
+            let bytes = self.as_mut_ptr().cast::<MaybeUninit<u8>>();
+            for index in len..self.capacity() {
+                bytes.add(index).write(MaybeUninit::uninit());
+            }
         }
-
-        self.len = l;
+        self.len = len;
     }
+
     pub fn clear(&mut self) {
         self.truncate(0);
     }
 
-    pub fn set_slice(&mut self, s: &[u8]) -> Result<(), PathTooLong> {
-        if s.len() > MAX_PATH {
+    pub fn set_path(&mut self, path: &[u8]) -> Result<(), PathTooLong> {
+        if path.len() > MAX_PATH {
             return Err(PathTooLong);
         }
 
+        self.clear();
         unsafe {
-            self.write_some(|p| {
-                copy_nonoverlapping(s.as_ptr(), p, s.len());
-                s.len()
-            })
-        };
+            copy_nonoverlapping(path.as_ptr(), self.as_mut_ptr(), path.len());
+        }
+        self.len = path.len();
         Ok(())
     }
 
+    pub fn set_bytes(&mut self, bytes: &[u8]) {
+        self.clear();
+        self.ensure_capacity(bytes.len());
+        unsafe {
+            copy_nonoverlapping(bytes.as_ptr(), self.as_mut_ptr(), bytes.len());
+        }
+        self.len = bytes.len();
+    }
+
+    /// Copies an explicitly sized pathname from another process.
+    pub fn copy_from_process_path_with_len(
+        &mut self,
+        pid: libc::pid_t,
+        address: u64,
+        len: usize,
+    ) -> io::Result<&[u8]> {
+        if len > MAX_PATH {
+            return Err(path_too_long());
+        }
+
+        let mut result = Ok(());
+        unsafe {
+            self.write_path_with(|destination| {
+                copy_process_memory(pid, address, destination, len, &mut result)
+            });
+        }
+        result?;
+        Ok(self)
+    }
+
+    /// Copies a NUL-terminated pathname from another process.
+    ///
+    /// The returned slice excludes the NUL. Linux reserves one byte of
+    /// `PATH_MAX` for the terminator, so a missing NUL produces `ENAMETOOLONG`.
+    pub fn copy_from_process_c_path(
+        &mut self,
+        pid: libc::pid_t,
+        address: u64,
+    ) -> io::Result<&[u8]> {
+        self.copy_from_process_path_with_len(pid, address, MAX_PATH)?;
+        self.truncate_at_nul();
+
+        if self.len == MAX_PATH {
+            return Err(path_too_long());
+        }
+
+        Ok(self)
+    }
+
+    /// Copies exactly `len` bytes from another process.
+    pub fn copy_from_process_bytes(
+        &mut self,
+        pid: libc::pid_t,
+        address: u64,
+        len: usize,
+    ) -> io::Result<&[u8]> {
+        let mut result = Ok(());
+        unsafe {
+            self.write_bytes_with(len, |destination| {
+                copy_process_memory(pid, address, destination, len, &mut result)
+            });
+        }
+        result?;
+        Ok(self)
+    }
+
+    /// Writes a path into the first page of the buffer.
+    ///
     /// # Safety
     ///
     /// The closure must initialize every byte before the returned length and
     /// must neither write nor return a length greater than [`MAX_PATH`].
-    pub unsafe fn write_some(&mut self, f: impl FnOnce(*mut u8) -> usize) {
+    pub unsafe fn write_path_with(&mut self, write: impl FnOnce(*mut u8) -> usize) {
         self.clear();
-        let r = &raw mut self.buf.bytes;
-        self.len = f(r.cast());
+        let len = write(self.as_mut_ptr());
+        self.len = len;
     }
 
-    pub fn chop_by_null(&mut self) {
-        for (i, b) in self.iter().enumerate() {
-            if *b == 0 {
-                self.truncate(i);
-                return;
-            }
+    /// Grows the buffer for `capacity` bytes, then writes general data into it.
+    ///
+    /// # Safety
+    ///
+    /// The closure must initialize every byte before the returned length and
+    /// must neither write nor return a length greater than `capacity`.
+    pub unsafe fn write_bytes_with(
+        &mut self,
+        capacity: usize,
+        write: impl FnOnce(*mut u8) -> usize,
+    ) {
+        self.clear();
+        self.ensure_capacity(capacity);
+        let len = write(self.as_mut_ptr());
+        self.len = len;
+    }
+
+    pub fn truncate_at_nul(&mut self) {
+        if let Some(nul) = self.iter().position(|&byte| byte == 0) {
+            self.truncate(nul);
         }
     }
+
+    fn ensure_capacity(&mut self, capacity: usize) {
+        if capacity <= self.capacity() {
+            return;
+        }
+
+        let page_count = capacity.div_ceil(MAX_PATH);
+        let mut pages = allocate_pages(page_count);
+        unsafe {
+            copy_nonoverlapping(self.as_ptr(), pages.as_mut_ptr().cast(), self.len);
+        }
+        self.pages = pages;
+    }
+}
+
+fn copy_process_memory(
+    pid: libc::pid_t,
+    address: u64,
+    destination: *mut u8,
+    len: usize,
+    result: &mut io::Result<()>,
+) -> usize {
+    match unsafe { read_process_memory(pid, address, destination, len) } {
+        Ok(read) => read,
+        Err(error) => {
+            *result = Err(error);
+            0
+        }
+    }
+}
+
+unsafe fn read_process_memory(
+    pid: libc::pid_t,
+    address: u64,
+    destination: *mut u8,
+    len: usize,
+) -> io::Result<usize> {
+    let mut copied = 0;
+
+    while copied < len {
+        let read = unsafe {
+            read_process_memory_once(pid, address, destination.add(copied), copied, len - copied)?
+        };
+        copied += read;
+    }
+
+    Ok(copied)
+}
+
+unsafe fn read_process_memory_once(
+    pid: libc::pid_t,
+    address: u64,
+    destination: *mut u8,
+    offset: usize,
+    len: usize,
+) -> io::Result<usize> {
+    let remote_address = usize::try_from(address)
+        .ok()
+        .and_then(|address| address.checked_add(offset))
+        .filter(|address| address.checked_add(len).is_some())
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?;
+    let local = libc::iovec {
+        iov_base: destination.cast(),
+        iov_len: len,
+    };
+    let remote = libc::iovec {
+        iov_base: remote_address as *mut libc::c_void,
+        iov_len: len,
+    };
+    let read = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+
+    if read < 0 {
+        Err(io::Error::last_os_error())
+    } else if read == 0 && len != 0 {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "process_vm_readv copied no data",
+        ))
+    } else {
+        Ok(read as usize)
+    }
+}
+
+fn path_too_long() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENAMETOOLONG)
+}
+
+fn allocate_pages(count: usize) -> Box<[Page]> {
+    let pages = Box::<[Page]>::new_uninit_slice(count);
+    // Every bit pattern is valid because Page contains only MaybeUninit bytes.
+    unsafe { transmute(pages) }
 }
 
 #[cfg(test)]
@@ -98,21 +304,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_buffer_manages_initialized_bytes() {
-        let mut buffer = PathBuffer {
-            buf: Box::new(Buffer {
-                bytes: [MaybeUninit::uninit(); MAX_PATH],
-            }),
-            len: 0,
-        };
+    fn starts_with_one_aligned_page() {
+        let buffer = PageBuffer::new();
 
-        assert_eq!((buffer.buf.bytes.as_ptr() as usize) % MAX_PATH, 0);
+        assert_eq!(buffer.capacity(), MAX_PATH);
+        assert_eq!((buffer.as_ptr() as usize) % MAX_PATH, 0);
         assert!(buffer.is_empty());
+    }
 
-        buffer.set_slice(b"some/path\0ignored").unwrap();
+    #[test]
+    fn path_operations_stay_within_path_max() {
+        let mut buffer = PageBuffer::new();
+
+        buffer.set_path(b"some/path\0ignored").unwrap();
         assert_eq!(&*buffer, b"some/path\0ignored");
 
-        buffer.chop_by_null();
+        buffer.truncate_at_nul();
         assert_eq!(&*buffer, b"some/path");
 
         buffer.truncate(4);
@@ -121,7 +328,111 @@ mod tests {
         buffer.clear();
         assert!(buffer.is_empty());
 
-        assert_eq!(buffer.set_slice(&[0; MAX_PATH + 1]), Err(PathTooLong));
+        assert_eq!(buffer.set_path(&[0; MAX_PATH + 1]), Err(PathTooLong));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn general_operations_grow_in_aligned_pages() {
+        let mut buffer = PageBuffer::new();
+        let bytes = vec![42; MAX_PATH + 1];
+
+        buffer.set_bytes(&bytes);
+
+        assert_eq!(buffer.capacity(), MAX_PATH * 2);
+        assert_eq!((buffer.as_ptr() as usize) % MAX_PATH, 0);
+        assert_eq!(&*buffer, bytes);
+    }
+
+    #[test]
+    fn closure_writes_have_distinct_path_and_byte_capacities() {
+        let mut buffer = PageBuffer::new();
+
+        unsafe {
+            buffer.write_path_with(|destination| {
+                copy_nonoverlapping(b"path".as_ptr(), destination, 4);
+                4
+            });
+        }
+        assert_eq!(&*buffer, b"path");
+
+        unsafe {
+            buffer.write_bytes_with(MAX_PATH + 8, |destination| {
+                destination.write_bytes(7, MAX_PATH + 8);
+                MAX_PATH + 8
+            });
+        }
+        assert_eq!(buffer.capacity(), MAX_PATH * 2);
+        assert_eq!(buffer.len(), MAX_PATH + 8);
+        assert!(buffer.iter().all(|&byte| byte == 7));
+    }
+
+    #[cfg(not(miri))]
+    mod process_copy {
+        use super::*;
+
+        #[test]
+        fn copies_explicitly_sized_paths_and_bytes() {
+            let path = b"path\0after";
+            let bytes = vec![42; MAX_PATH + 1];
+            let mut buffer = PageBuffer::new();
+            let pid = unsafe { libc::getpid() };
+
+            let copied = buffer
+                .copy_from_process_path_with_len(pid, path.as_ptr() as u64, path.len())
+                .unwrap();
+            assert_eq!(copied, path);
+
+            let copied = buffer
+                .copy_from_process_bytes(pid, bytes.as_ptr() as u64, bytes.len())
+                .unwrap();
+            assert_eq!(copied, bytes);
+        }
+
+        #[test]
+        fn rejects_an_explicit_path_larger_than_path_max() {
+            let mut buffer = PageBuffer::new();
+            let error = buffer
+                .copy_from_process_path_with_len(unsafe { libc::getpid() }, 0, MAX_PATH + 1)
+                .unwrap_err();
+
+            assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+        }
+
+        #[test]
+        fn copies_c_paths_without_the_nul() {
+            let path = b"some/path\0ignored";
+            let mut buffer = PageBuffer::new();
+
+            let copied = buffer
+                .copy_from_process_c_path(unsafe { libc::getpid() }, path.as_ptr() as u64)
+                .unwrap();
+
+            assert_eq!(copied, b"some/path");
+        }
+
+        #[test]
+        fn rejects_c_paths_without_a_nul_in_path_max() {
+            let path = [b'x'; MAX_PATH];
+            let mut buffer = PageBuffer::new();
+            let error = buffer
+                .copy_from_process_c_path(unsafe { libc::getpid() }, path.as_ptr() as u64)
+                .unwrap_err();
+
+            assert_eq!(error.raw_os_error(), Some(libc::ENAMETOOLONG));
+        }
+
+        #[test]
+        fn accepts_the_longest_c_path() {
+            let mut path = [b'x'; MAX_PATH];
+            path[MAX_PATH - 1] = 0;
+            let mut buffer = PageBuffer::new();
+            let copied = buffer
+                .copy_from_process_c_path(unsafe { libc::getpid() }, path.as_ptr() as u64)
+                .unwrap();
+
+            assert_eq!(copied.len(), MAX_PATH - 1);
+            assert!(copied.iter().all(|&byte| byte == b'x'));
+        }
     }
 }

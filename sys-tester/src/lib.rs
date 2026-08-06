@@ -17,12 +17,14 @@ use std::num::NonZero;
 pub type Text = &'static str;
 pub type ErrCode = Option<NonZero<u32>>;
 
+
+
 #[derive(Debug, Clone, Copy)]
 pub enum AtomData {
     Open(Text),
-    Read(Text, usize),
-    Write(Text, usize),
-    Close(Text),
+    Read(u32,Text, usize),//text.len <= size
+    Write(u32,Text, usize), //size <= text.len
+    Close(u32),
 
     ///this is used as a way to give collections of atoms names
     ///Atom::DebugName("Task Start")
@@ -30,6 +32,19 @@ pub enum AtomData {
     ///which can give nicer debug prints at times
     DebugName(Text),
 }
+
+// impl From<AtomData> for AtomReq {
+
+// fn from(a: AtomData) -> Self {
+//     match a {
+//         AtomData::Open(x)=>AtomReq::Open(x),
+//         AtomData::Read(_,x)=>AtomReq::Read(x),
+//         AtomData::Write(x,_)=>AtomReq::Write(x),
+//         AtomData::Close(x)=>AtomReq::Close(x),
+//         AtomData::DebugName(_) => todo!(),
+//     }
+// }
+// }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Atom {

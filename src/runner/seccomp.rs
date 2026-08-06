@@ -1,14 +1,15 @@
 use std::io;
 use std::os::fd::RawFd;
 
-use crate::seccomp_filters::X86_64_FINAL;
+use crate::seccomp_filters::X86_64_RANGE_STRICT;
 
-/// Installs the build-generated final filter and returns its notification listener.
+/// Installs the build-generated reserved-range strict filter and returns its
+/// notification listener.
 ///
 /// Filter construction belongs to the build script. This runtime path only
 /// passes generated classic BPF to the kernel and does not link libseccomp.
 pub fn install_seccomp_filter() -> io::Result<RawFd> {
-    install_filter(&X86_64_FINAL)
+    install_filter(&X86_64_RANGE_STRICT)
 }
 
 fn install_filter(filter: &'static [libc::sock_filter]) -> io::Result<RawFd> {
@@ -39,8 +40,7 @@ fn install_filter(filter: &'static [libc::sock_filter]) -> io::Result<RawFd> {
     }
 }
 
-
-#[cfg(not(miri))]//we have raw syscalls here
+#[cfg(not(miri))] //we have raw syscalls here
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,7 +51,7 @@ mod tests {
     use std::os::fd::RawFd;
     use std::ptr;
 
-    use crate::seccomp_filters::X86_64_BOOTSTRAP;
+    use crate::seccomp_filters::X86_64_RANGE_FILE_ONLY;
 
     // =========================================================================
     // Small general-purpose FD wrapper
@@ -332,12 +332,10 @@ mod tests {
         Ok(())
     }
 
-    /// Install the test policy.
-    ///
-    /// sendmsg is the sole bootstrap exception. The child needs it once to
-    /// transfer the listener FD to the parent.
+    /// Install the test policy. The reserved-range policy allows sendmsg on the
+    /// child's ordinary bootstrap socket while still notifying for openat.
     fn install_test_filter() -> io::Result<RawFd> {
-        install_filter(&X86_64_BOOTSTRAP)
+        install_filter(&X86_64_RANGE_FILE_ONLY)
     }
 
     /// Exit without invoking Rust destructors or libc shutdown machinery.

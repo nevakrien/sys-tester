@@ -25,8 +25,7 @@ macro_rules! filter_len {
 
 macro_rules! include_filter {
     ($file:literal) => {{
-        const BYTES: &[u8; generated_filter_bytes!($file).len()] =
-            generated_filter_bytes!($file);
+        const BYTES: &[u8; generated_filter_bytes!($file).len()] = generated_filter_bytes!($file);
 
         const LEN: usize = filter_len!($file);
 
@@ -35,12 +34,7 @@ macro_rules! include_filter {
         // - sock_filter contains only integer fields;
         // - therefore every possible byte pattern is valid;
         // - transmute copies the value, so BYTES need not have sock_filter alignment.
-        unsafe {
-            std::mem::transmute::<
-                [u8; BYTES.len()],
-                [libc::sock_filter; LEN],
-            >(*BYTES)
-        }
+        unsafe { std::mem::transmute::<[u8; BYTES.len()], [libc::sock_filter; LEN]>(*BYTES) }
     }};
 }
 
@@ -53,10 +47,16 @@ const _: () = {
 pub type SeccompFilter<const LEN: usize> = [libc::sock_filter; LEN];
 
 #[allow(dead_code)]
-pub const X86_64_BOOTSTRAP: SeccompFilter<{
-    filter_len!("x86_64_bootstrap.bpf")
-}> = include_filter!("x86_64_bootstrap.bpf");
+pub const X86_64_RANGE_FILE_ONLY: SeccompFilter<{ filter_len!("x86_64_range_file_only.bpf") }> =
+    include_filter!("x86_64_range_file_only.bpf");
 
-pub const X86_64_FINAL: SeccompFilter<{
-    filter_len!("x86_64_final.bpf")
-}> = include_filter!("x86_64_final.bpf");
+pub const X86_64_RANGE_STRICT: SeccompFilter<{ filter_len!("x86_64_range_strict.bpf") }> =
+    include_filter!("x86_64_range_strict.bpf");
+
+#[allow(dead_code)]
+pub const X86_64_MAPPED_FILE_ONLY: SeccompFilter<{ filter_len!("x86_64_mapped_file_only.bpf") }> =
+    include_filter!("x86_64_mapped_file_only.bpf");
+
+#[allow(dead_code)]
+pub const X86_64_MAPPED_STRICT: SeccompFilter<{ filter_len!("x86_64_mapped_strict.bpf") }> =
+    include_filter!("x86_64_mapped_strict.bpf");

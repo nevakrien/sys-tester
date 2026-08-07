@@ -12,6 +12,9 @@ const STATE_LISTENER_CREATED: u32 = 1;
 const STATE_SPAWNED: u32 = 2;
 const STATE_FAILED: u32 = 3;
 
+const STARTUP_PENDING: u32 = 0;
+const STARTUP_DONE: u32 = 1;
+
 const TRANSFER_BYTE: u8 = 0x53;
 const TARGET_STACK_SIZE: usize = 1024 * 1024;
 
@@ -83,6 +86,7 @@ impl std::error::Error for SpawnError {}
 
 #[repr(C)]
 struct SharedStartup {
+    done: AtomicU32,
     state: AtomicU32,
     target_pid: AtomicI32,
     listener_fd: AtomicI32,
@@ -130,6 +134,7 @@ impl StartupExchange {
             NonNull::new(mapping.cast::<SharedStartup>()).expect("successful mmap returned null");
         unsafe {
             ptr.as_ptr().write(SharedStartup {
+                done: AtomicU32::new(STARTUP_PENDING),
                 state: AtomicU32::new(STATE_EMPTY),
                 target_pid: AtomicI32::new(-1),
                 listener_fd: AtomicI32::new(-1),
@@ -143,6 +148,7 @@ impl StartupExchange {
 
     fn reset(&mut self) {
         let shared = unsafe { self.ptr.as_ref() };
+        shared.done.store(STARTUP_PENDING, Ordering::Relaxed);
         shared.target_pid.store(-1, Ordering::Relaxed);
         shared.listener_fd.store(-1, Ordering::Relaxed);
         shared
@@ -261,6 +267,11 @@ pub unsafe fn spawn_seccomp_target<'a>(
 
     if spawner_pid == 0 {
         let exit_code = unsafe { spawner_main(&mut args) };
+        // This is the sole publication point from the spawner to the
+        // supervisor. All shared startup fields are final before this store.
+        unsafe { &*args.shared }
+            .done
+            .store(STARTUP_DONE, Ordering::Release);
         unsafe { libc::_exit(exit_code) };
     }
 
@@ -272,11 +283,17 @@ pub unsafe fn spawn_seccomp_target<'a>(
     let wait_result = waitpid_nointr(spawner_pid);
 
     let shared = exchange.shared();
+    let mut startup_done = false;
     let result = (|| {
         let status = wait_result
             .map_err(|error| SpawnError::new(StartupStep::CloneTarget, errno_from_io(&error)))?;
 
-        if shared.state.load(Ordering::Acquire) == STATE_FAILED {
+        if shared.done.load(Ordering::Acquire) != STARTUP_DONE {
+            return Err(SpawnError::new(StartupStep::CloneTarget, libc::ECHILD));
+        }
+        startup_done = true;
+
+        if shared.state.load(Ordering::Relaxed) == STATE_FAILED {
             return Err(read_shared_error(shared));
         }
 
@@ -288,7 +305,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
             SpawnError::new(StartupStep::TransferListener, errno_from_io(&error))
         })?;
 
-        if shared.state.load(Ordering::Acquire) != STATE_SPAWNED {
+        if shared.state.load(Ordering::Relaxed) != STATE_SPAWNED {
             return Err(SpawnError::new(StartupStep::CloneTarget, libc::EIO));
         }
 
@@ -300,7 +317,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
         Ok(SpawnedProcess { pid, listener })
     })();
 
-    if result.is_err() {
+    if result.is_err() && startup_done {
         terminate_and_reap_target(shared);
     }
 
@@ -326,20 +343,20 @@ unsafe fn spawner_main(args: &mut SpawnerArgs<'_>) -> libc::c_int {
     let shared = unsafe { &*args.shared };
 
     if let Err(errno) = install_standard_stream(args.stdin.take(), libc::STDIN_FILENO) {
-        publish_failure(shared, StartupStep::Stdin, errno);
+        record_failure(shared, StartupStep::Stdin, errno);
         return 127;
     }
     if let Err(errno) = install_standard_stream(args.stdout.take(), libc::STDOUT_FILENO) {
-        publish_failure(shared, StartupStep::Stdout, errno);
+        record_failure(shared, StartupStep::Stdout, errno);
         return 127;
     }
     if let Err(errno) = install_standard_stream(args.stderr.take(), libc::STDERR_FILENO) {
-        publish_failure(shared, StartupStep::Stderr, errno);
+        record_failure(shared, StartupStep::Stderr, errno);
         return 127;
     }
 
     if let Err(errno) = close_unwanted_fds(args.spawner_socket) {
-        publish_failure(shared, StartupStep::CloseDescriptors, errno);
+        record_failure(shared, StartupStep::CloseDescriptors, errno);
         return 127;
     }
 
@@ -360,7 +377,7 @@ unsafe fn spawner_main(args: &mut SpawnerArgs<'_>) -> libc::c_int {
     // original supervisor.
     let target_pid = unsafe { clone_target(&mut target_args) };
     if target_pid < 0 {
-        publish_failure(shared, StartupStep::CloneTarget, current_errno());
+        record_failure(shared, StartupStep::CloneTarget, current_errno());
         return 127;
     }
     shared.target_pid.store(target_pid, Ordering::Relaxed);
@@ -370,25 +387,25 @@ unsafe fn spawner_main(args: &mut SpawnerArgs<'_>) -> libc::c_int {
     }
 
     if shared.state.load(Ordering::Acquire) != STATE_LISTENER_CREATED {
-        publish_failure(shared, StartupStep::Exec, libc::EIO);
+        record_failure(shared, StartupStep::Exec, libc::EIO);
         unsafe { libc::kill(target_pid, libc::SIGKILL) };
         return 127;
     }
 
     let listener = shared.listener_fd.load(Ordering::Relaxed);
     if listener < 0 {
-        publish_failure(shared, StartupStep::InstallSeccomp, libc::EBADF);
+        record_failure(shared, StartupStep::InstallSeccomp, libc::EBADF);
         unsafe { libc::kill(target_pid, libc::SIGKILL) };
         return 127;
     }
 
     if let Err(errno) = send_fd(args.spawner_socket, listener) {
-        publish_failure(shared, StartupStep::TransferListener, errno);
+        record_failure(shared, StartupStep::TransferListener, errno);
         unsafe { libc::kill(target_pid, libc::SIGKILL) };
         return 127;
     }
 
-    shared.state.store(STATE_SPAWNED, Ordering::Release);
+    shared.state.store(STATE_SPAWNED, Ordering::Relaxed);
     0
 }
 
@@ -454,7 +471,7 @@ extern "C" fn target_entry(argument: *mut libc::c_void) -> libc::c_int {
     let shared = unsafe { &*args.shared };
 
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
-        publish_failure(shared, StartupStep::NoNewPrivileges, current_errno());
+        publish_target_failure(shared, StartupStep::NoNewPrivileges, current_errno());
         unsafe { libc::_exit(127) };
     }
 
@@ -472,7 +489,7 @@ extern "C" fn target_entry(argument: *mut libc::c_void) -> libc::c_int {
         )
     };
     if listener < 0 {
-        publish_failure(shared, StartupStep::InstallSeccomp, current_errno());
+        publish_target_failure(shared, StartupStep::InstallSeccomp, current_errno());
         unsafe { libc::_exit(127) };
     }
 
@@ -487,7 +504,7 @@ extern "C" fn target_entry(argument: *mut libc::c_void) -> libc::c_int {
         libc::execve(args.executable, args.argv, args.envp);
     }
 
-    publish_failure(shared, StartupStep::Exec, current_errno());
+    publish_target_failure(shared, StartupStep::Exec, current_errno());
     unsafe { libc::_exit(127) }
 }
 
@@ -525,7 +542,15 @@ unsafe fn clone_target(args: &mut TargetArgs) -> libc::pid_t {
     pid
 }
 
-fn publish_failure(shared: &SharedStartup, step: StartupStep, errno: libc::c_int) {
+fn record_failure(shared: &SharedStartup, step: StartupStep, errno: libc::c_int) {
+    shared.error_step.store(step as u32, Ordering::Relaxed);
+    shared
+        .error_code
+        .store(normalize_errno(errno), Ordering::Relaxed);
+    shared.state.store(STATE_FAILED, Ordering::Relaxed);
+}
+
+fn publish_target_failure(shared: &SharedStartup, step: StartupStep, errno: libc::c_int) {
     shared.error_step.store(step as u32, Ordering::Relaxed);
     shared
         .error_code
@@ -820,6 +845,7 @@ mod tests {
             )
         }
         .expect("target startup failed");
+        assert_eq!(exchange.shared().done.load(Ordering::Acquire), STARTUP_DONE);
         let guard = ChildGuard(process.pid);
 
         let notification = loop {
@@ -870,6 +896,7 @@ mod tests {
 
         assert_eq!(error.step, StartupStep::Exec);
         assert_eq!(error.errno, libc::ENOENT);
+        assert_eq!(exchange.shared().done.load(Ordering::Acquire), STARTUP_DONE);
 
         let target_pid = exchange.shared().target_pid.load(Ordering::Relaxed);
         assert!(target_pid > 0);
@@ -878,5 +905,33 @@ mod tests {
         let result = unsafe { libc::waitpid(target_pid, &mut status, libc::WNOHANG) };
         assert_eq!(result, -1);
         assert_eq!(current_errno(), libc::ECHILD);
+    }
+
+    #[test]
+    fn spawner_failure_is_published_before_return() {
+        let mut exchange = StartupExchange::new().expect("startup exchange creation failed");
+        let executable = c"/proc/self/exe";
+        let argv = [executable.as_ptr(), ptr::null()];
+        let envp = [ptr::null()];
+        let mut stdin = || Err(libc::EACCES);
+
+        let result = unsafe {
+            spawn_seccomp_target(
+                &mut exchange,
+                &X86_64_RANGE_STRICT,
+                executable.as_ptr(),
+                argv.as_ptr(),
+                envp.as_ptr(),
+                Some(&mut stdin),
+                None,
+                None,
+            )
+        };
+        let error = result.err().expect("stdin failure unexpectedly spawned");
+
+        assert_eq!(error.step, StartupStep::Stdin);
+        assert_eq!(error.errno, libc::EACCES);
+        assert_eq!(exchange.shared().done.load(Ordering::Acquire), STARTUP_DONE);
+        assert_eq!(exchange.shared().target_pid.load(Ordering::Relaxed), -1);
     }
 }

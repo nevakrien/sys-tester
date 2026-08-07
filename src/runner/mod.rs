@@ -4,7 +4,7 @@
 //! crate because they cooperate on the same compiled test model.
 
 mod errno;
-mod fd;
+pub mod fd;
 mod request;
 mod supervisor;
 pub mod spawn;

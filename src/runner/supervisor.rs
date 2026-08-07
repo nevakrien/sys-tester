@@ -1,3 +1,4 @@
+use crate::runner::Tracker;
 use crate::graph::DirectedGraph;
 use crate::index::IndexVec;
 use foldhash::{HashMap, HashMapExt};
@@ -9,7 +10,7 @@ use std::os::fd::RawFd;
 
 pub struct Supervisor<PF: ProcFileSpace> {
     pub buffer: PageBuffer,
-    procs: HashMap<libc::pid_t, PF>,
+    procs: HashMap<libc::pid_t, (Tracker,PF)>,
 
     ready_atoms: HashMap<AtomReq, Vec<u32>>,
     wait_counts: IndexVec<u32, u32>, //MAX for already done
@@ -68,7 +69,7 @@ impl<PF: ProcFileSpace> Supervisor<PF> {
     }
 
     pub fn map_fd(&self, p: libc::pid_t, fd: RawFd) -> Option<ChildFile> {
-        self.procs.get(&p)?.lookup_fd(fd)
+        self.procs.get(&p)?.1.lookup_fd(fd)
     }
     pub fn get_task(&mut self, r: &AtomReq) -> Option<(u32, usize)> {
         let r = self.ready_atoms.get_mut(r)?;

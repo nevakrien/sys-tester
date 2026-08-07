@@ -1,7 +1,5 @@
+use crate::MockFd;
 use std::os::fd::RawFd;
-
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
-pub struct MockFd(pub u32);
 
 pub enum ChildFile {
     Real,

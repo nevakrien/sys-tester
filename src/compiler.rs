@@ -309,7 +309,7 @@ impl TaskInfo {
         };
         let reduced = transitive_solved_reduction(&atom_graph, &atom_order);
 
-        let ordered_atoms = atom_order
+        let ordered_atoms: Vec<Atom> = atom_order
             .order
             .iter()
             .map(|&atom| atoms[atom as usize])
@@ -330,6 +330,7 @@ impl TaskInfo {
 
         Ok(CompiledSetup {
             atoms: ordered_atoms,
+            file_count: self.file_count as usize,
             after_graph,
             before_graph,
         })
@@ -377,6 +378,7 @@ mod tests {
                 Task::Ordered(vec![0, 1, 2]),
             ],
             happens_before: HashMap::new(),
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -401,6 +403,7 @@ mod tests {
                 Task::Ordered(vec![2, 3]),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -423,6 +426,7 @@ mod tests {
                 Task::Ordered(vec![4, 5]),
             ],
             happens_before: HashMap::new(),
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -443,6 +447,7 @@ mod tests {
                 Task::Ordered(vec![0, 2, 1]),
             ],
             happens_before: HashMap::new(),
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -457,6 +462,7 @@ mod tests {
         let info = TaskInfo {
             tasks: vec![atom("a"), atom("b")],
             happens_before,
+            file_count: 0,
         };
 
         let compiled = info.compile().unwrap();
@@ -479,6 +485,7 @@ mod tests {
         let info = TaskInfo {
             tasks: vec![atom("a"), atom("b"), Task::Unordered(vec![])],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -505,6 +512,7 @@ mod tests {
                 Task::Unordered(vec![2, 3]),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -529,6 +537,7 @@ mod tests {
                 Task::Ordered(vec![0, 2, 1]),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -554,6 +563,7 @@ mod tests {
                 Task::Ordered(vec![0, 2, 1]),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -583,6 +593,7 @@ mod tests {
                 Task::Unordered(vec![2, 3]),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -612,6 +623,7 @@ mod tests {
                 Task::Unordered(vec![4]),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -639,6 +651,7 @@ mod tests {
                 atom("e"),
             ],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -662,6 +675,7 @@ mod tests {
         let info = TaskInfo {
             tasks: vec![atom("a"), atom("b"), atom("c"), Task::Unordered(vec![])],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -681,6 +695,7 @@ mod tests {
         let info = TaskInfo {
             tasks: vec![atom("a"), atom("b"), atom("c"), Task::Ordered(vec![])],
             happens_before,
+            file_count: 0,
         };
 
         let work = info.compile().unwrap();
@@ -700,6 +715,7 @@ mod tests {
         let info = TaskInfo {
             tasks: vec![atom("a"), Task::Unordered(vec![])],
             happens_before,
+            file_count: 0,
         };
 
         let cycle = info.compile().unwrap_err();

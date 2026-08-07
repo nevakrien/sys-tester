@@ -7,6 +7,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
+use super::{Tracker, errno};
+
 const STATE_EMPTY: u32 = 0;
 const STATE_LISTENER_CREATED: u32 = 1;
 const STATE_SPAWNED: u32 = 2;
@@ -62,7 +64,7 @@ impl SpawnError {
     fn new(step: StartupStep, errno: libc::c_int) -> Self {
         Self {
             step,
-            errno: normalize_errno(errno),
+            errno: errno::normalize(errno),
         }
     }
 
@@ -178,12 +180,6 @@ impl Drop for StartupExchange {
 // enforced by `&mut StartupExchange`.
 unsafe impl Send for StartupExchange {}
 
-pub struct SpawnedProcess {
-    /// The final target is made a direct child of the supervisor by CLONE_PARENT.
-    pub pid: libc::pid_t,
-    pub listener: OwnedFd,
-}
-
 struct SpawnerArgs<'a> {
     shared: *mut SharedStartup,
     filter: &'a [libc::sock_filter],
@@ -241,12 +237,12 @@ pub unsafe fn spawn_seccomp_target<'a>(
     stdin: Option<FdFactory<'a>>,
     stdout: Option<FdFactory<'a>>,
     stderr: Option<FdFactory<'a>>,
-) -> Result<SpawnedProcess, SpawnError> {
+) -> Result<Tracker, SpawnError> {
     validate_inputs(filter, executable, argv, envp)?;
     exchange.reset();
 
     let [supervisor_socket, spawner_socket] = socket_pair()
-        .map_err(|error| SpawnError::new(StartupStep::TransferListener, errno_from_io(&error)))?;
+        .map_err(|error| SpawnError::new(StartupStep::TransferListener, errno::from_io(&error)))?;
 
     let mut args = SpawnerArgs {
         shared: exchange.as_ptr(),
@@ -262,7 +258,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
 
     let spawner_pid = unsafe { libc::fork() };
     if spawner_pid < 0 {
-        return Err(SpawnError::new(StartupStep::CloneTarget, current_errno()));
+        return Err(SpawnError::new(StartupStep::CloneTarget, errno::get()));
     }
 
     if spawner_pid == 0 {
@@ -286,7 +282,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
     let mut startup_done = false;
     let result = (|| {
         let status = wait_result
-            .map_err(|error| SpawnError::new(StartupStep::CloneTarget, errno_from_io(&error)))?;
+            .map_err(|error| SpawnError::new(StartupStep::CloneTarget, errno::from_io(&error)))?;
 
         if shared.done.load(Ordering::Acquire) != STARTUP_DONE {
             return Err(SpawnError::new(StartupStep::CloneTarget, libc::ECHILD));
@@ -302,7 +298,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
         }
 
         let listener = listener_result.map_err(|error| {
-            SpawnError::new(StartupStep::TransferListener, errno_from_io(&error))
+            SpawnError::new(StartupStep::TransferListener, errno::from_io(&error))
         })?;
 
         if shared.state.load(Ordering::Relaxed) != STATE_SPAWNED {
@@ -314,7 +310,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
             return Err(SpawnError::new(StartupStep::CloneTarget, libc::ECHILD));
         }
 
-        Ok(SpawnedProcess { pid, listener })
+        Ok(Tracker::new(pid, listener))
     })();
 
     if result.is_err() && startup_done {
@@ -377,7 +373,7 @@ unsafe fn spawner_main(args: &mut SpawnerArgs<'_>) -> libc::c_int {
     // original supervisor.
     let target_pid = unsafe { clone_target(&mut target_args) };
     if target_pid < 0 {
-        record_failure(shared, StartupStep::CloneTarget, current_errno());
+        record_failure(shared, StartupStep::CloneTarget, errno::get());
         return 127;
     }
     shared.target_pid.store(target_pid, Ordering::Relaxed);
@@ -417,7 +413,7 @@ fn install_standard_stream(
         return Ok(());
     };
 
-    let source = factory().map_err(normalize_errno)?;
+    let source = factory().map_err(errno::normalize)?;
     if source < 0 {
         return Err(libc::EBADF);
     }
@@ -429,7 +425,7 @@ fn install_standard_stream(
     }
 
     if unsafe { libc::dup2(source, destination) } < 0 {
-        let errno = current_errno();
+        let errno = errno::get();
         unsafe { libc::close(source) };
         return Err(errno);
     }
@@ -459,7 +455,7 @@ fn close_range(first: u32, last: u32) -> Result<(), libc::c_int> {
             return Ok(());
         }
 
-        let errno = current_errno();
+        let errno = errno::get();
         if errno != libc::EINTR {
             return Err(errno);
         }
@@ -471,7 +467,7 @@ extern "C" fn target_entry(argument: *mut libc::c_void) -> libc::c_int {
     let shared = unsafe { &*args.shared };
 
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
-        publish_target_failure(shared, StartupStep::NoNewPrivileges, current_errno());
+        publish_target_failure(shared, StartupStep::NoNewPrivileges, errno::get());
         unsafe { libc::_exit(127) };
     }
 
@@ -489,7 +485,7 @@ extern "C" fn target_entry(argument: *mut libc::c_void) -> libc::c_int {
         )
     };
     if listener < 0 {
-        publish_target_failure(shared, StartupStep::InstallSeccomp, current_errno());
+        publish_target_failure(shared, StartupStep::InstallSeccomp, errno::get());
         unsafe { libc::_exit(127) };
     }
 
@@ -504,7 +500,7 @@ extern "C" fn target_entry(argument: *mut libc::c_void) -> libc::c_int {
         libc::execve(args.executable, args.argv, args.envp);
     }
 
-    publish_target_failure(shared, StartupStep::Exec, current_errno());
+    publish_target_failure(shared, StartupStep::Exec, errno::get());
     unsafe { libc::_exit(127) }
 }
 
@@ -536,9 +532,9 @@ unsafe fn clone_target(args: &mut TargetArgs) -> libc::pid_t {
         )
     };
 
-    let saved_errno = current_errno();
+    let saved_errno = errno::get();
     unsafe { libc::munmap(stack, TARGET_STACK_SIZE) };
-    set_errno(saved_errno);
+    errno::set(saved_errno);
     pid
 }
 
@@ -546,7 +542,7 @@ fn record_failure(shared: &SharedStartup, step: StartupStep, errno: libc::c_int)
     shared.error_step.store(step as u32, Ordering::Relaxed);
     shared
         .error_code
-        .store(normalize_errno(errno), Ordering::Relaxed);
+        .store(errno::normalize(errno), Ordering::Relaxed);
     shared.state.store(STATE_FAILED, Ordering::Relaxed);
 }
 
@@ -554,7 +550,7 @@ fn publish_target_failure(shared: &SharedStartup, step: StartupStep, errno: libc
     shared.error_step.store(step as u32, Ordering::Relaxed);
     shared
         .error_code
-        .store(normalize_errno(errno), Ordering::Relaxed);
+        .store(errno::normalize(errno), Ordering::Relaxed);
     shared.state.store(STATE_FAILED, Ordering::Release);
 }
 
@@ -626,7 +622,7 @@ fn send_fd(socket: RawFd, descriptor: RawFd) -> Result<(), libc::c_int> {
             return Ok(());
         }
         if result < 0 {
-            let errno = current_errno();
+            let errno = errno::get();
             if errno == libc::EINTR {
                 continue;
             }
@@ -660,7 +656,7 @@ fn recv_fd(socket: RawFd) -> io::Result<OwnedFd> {
         if count >= 0 {
             break count;
         }
-        if current_errno() != libc::EINTR {
+        if errno::get() != libc::EINTR {
             return Err(io::Error::last_os_error());
         }
     };
@@ -720,11 +716,11 @@ fn terminate_and_reap_target(shared: &SharedStartup) {
     let mut status = 0;
     loop {
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if result == pid || (result < 0 && current_errno() == libc::ECHILD) {
+        if result == pid || (result < 0 && errno::get() == libc::ECHILD) {
             return;
         }
         if result < 0 {
-            if current_errno() == libc::EINTR {
+            if errno::get() == libc::EINTR {
                 continue;
             }
             return;
@@ -743,33 +739,11 @@ fn waitpid_nointr(pid: libc::pid_t) -> io::Result<libc::c_int> {
         if result == pid {
             return Ok(status);
         }
-        if result < 0 && current_errno() == libc::EINTR {
+        if result < 0 && errno::get() == libc::EINTR {
             continue;
         }
         return Err(io::Error::last_os_error());
     }
-}
-
-fn normalize_errno(errno: libc::c_int) -> libc::c_int {
-    if errno > 0 {
-        errno
-    } else if errno < 0 {
-        -errno
-    } else {
-        libc::EIO
-    }
-}
-
-fn errno_from_io(error: &io::Error) -> libc::c_int {
-    error.raw_os_error().unwrap_or(libc::EIO)
-}
-
-fn current_errno() -> libc::c_int {
-    unsafe { *libc::__errno_location() }
-}
-
-fn set_errno(errno: libc::c_int) {
-    unsafe { *libc::__errno_location() = errno };
 }
 
 #[cfg(test)]
@@ -785,43 +759,6 @@ mod tests {
             unsafe { libc::kill(self.0, libc::SIGKILL) };
             let _ = waitpid_nointr(self.0);
         }
-    }
-
-    fn receive_notification(listener: RawFd) -> io::Result<libc::seccomp_notif> {
-        let mut notification = unsafe { mem::zeroed::<libc::seccomp_notif>() };
-        loop {
-            let result =
-                unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_RECV, &mut notification) };
-            if result == 0 {
-                return Ok(notification);
-            }
-            if current_errno() != libc::EINTR {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-
-    fn respond(listener: RawFd, id: u64, error: libc::c_int, flags: u32) -> io::Result<()> {
-        let response = libc::seccomp_notif_resp {
-            id,
-            val: 0,
-            error,
-            flags,
-        };
-        loop {
-            let result =
-                unsafe { libc::ioctl(listener, libc::SECCOMP_IOCTL_NOTIF_SEND, &response) };
-            if result == 0 {
-                return Ok(());
-            }
-            if current_errno() != libc::EINTR {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-
-    fn respond_errno(listener: RawFd, id: u64, errno: libc::c_int) -> io::Result<()> {
-        respond(listener, id, -normalize_errno(errno), 0)
     }
 
     #[test]
@@ -846,26 +783,24 @@ mod tests {
         }
         .expect("target startup failed");
         assert_eq!(exchange.shared().done.load(Ordering::Acquire), STARTUP_DONE);
-        let guard = ChildGuard(process.pid);
+        let guard = ChildGuard(process.pid());
 
         let notification = loop {
-            let notification = receive_notification(process.listener.as_raw_fd())
+            let notification = process
+                .recv()
                 .expect("failed to receive seccomp notification");
-            assert_eq!(notification.pid as libc::pid_t, process.pid);
+            assert_eq!(notification.pid as libc::pid_t, process.pid());
             if notification.data.nr as libc::c_long == libc::SYS_openat {
                 break notification;
             }
 
-            respond(
-                process.listener.as_raw_fd(),
-                notification.id,
-                0,
-                libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
-            )
-            .expect("failed to continue startup notification");
+            process
+                .continue_syscall(&notification)
+                .expect("failed to continue startup notification");
         };
 
-        respond_errno(process.listener.as_raw_fd(), notification.id, libc::EPIPE)
+        process
+            .respond_errno(&notification, libc::EPIPE)
             .expect("failed to respond to seccomp notification");
 
         drop(guard);
@@ -904,7 +839,7 @@ mod tests {
         let mut status = 0;
         let result = unsafe { libc::waitpid(target_pid, &mut status, libc::WNOHANG) };
         assert_eq!(result, -1);
-        assert_eq!(current_errno(), libc::ECHILD);
+        assert_eq!(errno::get(), libc::ECHILD);
     }
 
     #[test]

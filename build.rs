@@ -8,10 +8,12 @@
 //!
 //! The BPF filter is not the final policy engine.
 //!
-//! It performs only two decisions:
+//! It performs three decisions:
 //!
 //! - `ALLOW`: this syscall is irrelevant enough to execute without involving
 //!   the supervisor;
+//! - `TRACE`: process creation stops under ptrace so the supervisor can inspect
+//!   the syscall result and register a successfully created child;
 //! - `USER_NOTIF`: the supervisor must inspect it and decide what to do.
 //!
 //! We deliberately do not return automatic errno values for whole syscall
@@ -401,7 +403,8 @@ const NETWORK_TOPOLOGY: &[&str] = &[
     "listen",
 ];
 
-/// Process-tree creation.
+/// Process-tree creation. These calls use `SECCOMP_RET_TRACE`, not the
+/// `USER_NOTIF` fallback, so ptrace can observe their kernel return values.
 ///
 /// clone3 arguments are hidden behind a pointer, so its exact meaning must be
 /// decoded by the supervisor.
@@ -607,6 +610,12 @@ fn export_filter(path: &Path, policy: Policy) -> Result<(), Box<dyn Error>> {
         policy.fd_policy,
         FD_FILE_OPERATIONS,
     )?;
+    add_group(
+        &mut context,
+        &mut explicit,
+        ScmpAction::Trace(0),
+        PROCESS_TOPOLOGY,
+    )?;
     add_fd_arg0_rules(
         &mut context,
         &mut explicit,
@@ -623,7 +632,6 @@ fn export_filter(path: &Path, policy: Policy) -> Result<(), Box<dyn Error>> {
             FILESYSTEM_PATH_OPERATIONS,
             FD_TOPOLOGY,
             NETWORK_TOPOLOGY,
-            PROCESS_TOPOLOGY,
             SUPERVISED_EXECUTION,
             GENERAL_CASE_OPERATIONS,
             POLL_AND_READINESS,

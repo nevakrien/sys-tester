@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use super::{Tracker, errno};
+use super::{Tracker, errno, ptrace};
 
 const STATE_EMPTY: u32 = 0;
 const STATE_LISTENER_CREATED: u32 = 1;
@@ -17,6 +17,8 @@ const STATE_FAILED: u32 = 3;
 const STARTUP_PENDING: u32 = 0;
 const STARTUP_DONE: u32 = 1;
 
+const TARGET_READY_BYTE: u8 = 0x52;
+const TRACER_ATTACHED_BYTE: u8 = 0x41;
 const TRANSFER_BYTE: u8 = 0x53;
 const TARGET_STACK_SIZE: usize = 1024 * 1024;
 
@@ -35,6 +37,7 @@ pub enum StartupStep {
     InstallSeccomp = 7,
     Exec = 8,
     TransferListener = 9,
+    AttachTracer = 10,
 }
 
 impl StartupStep {
@@ -49,6 +52,7 @@ impl StartupStep {
             7 => Self::InstallSeccomp,
             8 => Self::Exec,
             9 => Self::TransferListener,
+            10 => Self::AttachTracer,
             _ => Self::None,
         }
     }
@@ -212,6 +216,7 @@ struct TargetArgs {
 /// - stdio setup has completed;
 /// - the target has installed seccomp;
 /// - the target has successfully crossed `execve()`;
+/// - ptrace has attached to the target;
 /// - the listener FD has been transferred to this supervisor; and
 /// - the temporary spawner has exited.
 ///
@@ -276,9 +281,28 @@ pub unsafe fn spawn_seccomp_target<'a>(
 
     drop(spawner_socket);
 
-    // This blocks until the spawner either sends the listener or exits and
-    // closes its socket endpoint.
-    let listener_result = recv_fd(supervisor_socket.as_raw_fd());
+    let listener_result = (|| {
+        let message = recv_control(supervisor_socket.as_raw_fd())
+            .map_err(|error| SpawnError::new(StartupStep::TransferListener, error))?;
+        if message != TARGET_READY_BYTE {
+            return Err(SpawnError::new(StartupStep::TransferListener, libc::EPROTO));
+        }
+
+        let pid = exchange.shared().target_pid.load(Ordering::Acquire);
+        if pid <= 0 {
+            return Err(SpawnError::new(StartupStep::CloneTarget, libc::ECHILD));
+        }
+        ptrace::seize(pid)
+            .map_err(|error| SpawnError::new(StartupStep::AttachTracer, errno::from_io(&error)))?;
+
+        send_control(supervisor_socket.as_raw_fd(), TRACER_ATTACHED_BYTE)
+            .map_err(|error| SpawnError::new(StartupStep::TransferListener, error))?;
+        recv_fd(supervisor_socket.as_raw_fd())
+            .map_err(|error| SpawnError::new(StartupStep::TransferListener, errno::from_io(&error)))
+    })();
+    if listener_result.is_err() {
+        drop(supervisor_socket);
+    }
     let wait_result = waitpid_nointr(spawner_pid);
 
     let shared = exchange.shared();
@@ -292,6 +316,12 @@ pub unsafe fn spawn_seccomp_target<'a>(
         }
         startup_done = true;
 
+        if let Err(error) = &listener_result
+            && error.step == StartupStep::AttachTracer
+        {
+            return Err(SpawnError::new(error.step, error.errno));
+        }
+
         if shared.state.load(Ordering::Relaxed) == STATE_FAILED {
             return Err(read_shared_error(shared));
         }
@@ -300,9 +330,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
             return Err(SpawnError::new(StartupStep::CloneTarget, libc::ECHILD));
         }
 
-        let listener = listener_result.map_err(|error| {
-            SpawnError::new(StartupStep::TransferListener, errno::from_io(&error))
-        })?;
+        let listener = listener_result?;
 
         if shared.state.load(Ordering::Relaxed) != STATE_SPAWNED {
             return Err(SpawnError::new(StartupStep::CloneTarget, libc::EIO));
@@ -379,7 +407,7 @@ unsafe fn spawner_main(args: &mut SpawnerArgs<'_>) -> libc::c_int {
         record_failure(shared, StartupStep::CloneTarget, errno::get());
         return 127;
     }
-    shared.target_pid.store(target_pid, Ordering::Relaxed);
+    shared.target_pid.store(target_pid, Ordering::Release);
 
     if shared.state.load(Ordering::Acquire) == STATE_FAILED {
         return 127;
@@ -396,6 +424,25 @@ unsafe fn spawner_main(args: &mut SpawnerArgs<'_>) -> libc::c_int {
         record_failure(shared, StartupStep::InstallSeccomp, libc::EBADF);
         unsafe { libc::kill(target_pid, libc::SIGKILL) };
         return 127;
+    }
+
+    if let Err(errno) = send_control(args.spawner_socket, TARGET_READY_BYTE) {
+        record_failure(shared, StartupStep::TransferListener, errno);
+        unsafe { libc::kill(target_pid, libc::SIGKILL) };
+        return 127;
+    }
+    match recv_control(args.spawner_socket) {
+        Ok(TRACER_ATTACHED_BYTE) => {}
+        Ok(_) => {
+            record_failure(shared, StartupStep::TransferListener, libc::EPROTO);
+            unsafe { libc::kill(target_pid, libc::SIGKILL) };
+            return 127;
+        }
+        Err(errno) => {
+            record_failure(shared, StartupStep::TransferListener, errno);
+            unsafe { libc::kill(target_pid, libc::SIGKILL) };
+            return 127;
+        }
     }
 
     if let Err(errno) = send_fd(args.spawner_socket, listener) {
@@ -586,6 +633,38 @@ fn socket_pair() -> io::Result<[OwnedFd; 2]> {
     })
 }
 
+fn send_control(socket: RawFd, byte: u8) -> Result<(), libc::c_int> {
+    loop {
+        let result =
+            unsafe { libc::send(socket, (&byte as *const u8).cast(), 1, libc::MSG_NOSIGNAL) };
+        if result == 1 {
+            return Ok(());
+        }
+        if result < 0 && errno::get() == libc::EINTR {
+            continue;
+        }
+        return Err(if result < 0 { errno::get() } else { libc::EIO });
+    }
+}
+
+fn recv_control(socket: RawFd) -> Result<u8, libc::c_int> {
+    let mut byte = 0;
+    loop {
+        let result = unsafe { libc::recv(socket, (&mut byte as *mut u8).cast(), 1, 0) };
+        if result == 1 {
+            return Ok(byte);
+        }
+        if result < 0 && errno::get() == libc::EINTR {
+            continue;
+        }
+        return Err(if result < 0 {
+            errno::get()
+        } else {
+            libc::EPIPE
+        });
+    }
+}
+
 fn send_fd(socket: RawFd, descriptor: RawFd) -> Result<(), libc::c_int> {
     let mut byte = TRANSFER_BYTE;
     let mut iov = libc::iovec {
@@ -755,42 +834,16 @@ mod tests {
 
     use crate::seccomp_filters::{X86_64_RANGE_FILE_ONLY, X86_64_RANGE_STRICT};
 
-    struct ChildGuard(libc::pid_t);
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            unsafe { libc::kill(self.0, libc::SIGKILL) };
-            let _ = waitpid_nointr(self.0);
-        }
-    }
+    use crate::runner::test_support::spawn_target;
 
     #[test]
     fn post_exec_openat_is_delivered_to_supervisor() {
-        let mut exchange = StartupExchange::new().expect("startup exchange creation failed");
-        let executable = c"/proc/self/exe";
-        let help = c"--help";
-        let argv = [executable.as_ptr(), help.as_ptr(), ptr::null()];
-        let envp = [ptr::null()];
-
-        let process = unsafe {
-            spawn_seccomp_target(
-                &mut exchange,
-                &X86_64_RANGE_FILE_ONLY,
-                executable.as_ptr(),
-                argv.as_ptr(),
-                envp.as_ptr(),
-                None,
-                None,
-                None,
-            )
-        }
-        .expect("target startup failed");
-        assert_eq!(exchange.shared().done.load(Ordering::Acquire), STARTUP_DONE);
-        let (mut process, pid) = process;
-        let guard = ChildGuard(pid);
+        let target = spawn_target(&X86_64_RANGE_FILE_ONLY, c"/proc/self/exe", &[c"--help"]);
+        let pid = target.pid();
 
         let notification = loop {
-            let notification = process
+            let notification = target
+                .tracker
                 .recv()
                 .expect("failed to receive seccomp notification");
             assert_eq!(notification.pid as libc::pid_t, pid);
@@ -798,16 +851,16 @@ mod tests {
                 break notification;
             }
 
-            process
+            target
+                .tracker
                 .continue_syscall(&notification)
                 .expect("failed to continue startup notification");
         };
 
-        process
+        target
+            .tracker
             .respond_errno(&notification, libc::EPIPE)
             .expect("failed to respond to seccomp notification");
-
-        drop(guard);
     }
 
     #[test]

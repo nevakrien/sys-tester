@@ -2,6 +2,7 @@ use crate::MOCK_FD_BASE;
 use foldhash::HashMap;
 use std::io;
 use std::os::fd::{BorrowedFd, RawFd};
+use std::sync::Arc;
 
 use crate::MockFd;
 use crate::runner::Tracker;
@@ -15,7 +16,13 @@ pub enum ChildFile {
 #[derive(Debug)]
 pub struct CantAllocate;
 
-pub trait ProcFileSpace {
+/// Models the file table of one child process.
+///
+/// Changes require exclusive access. A syscall continued while shared access
+/// is held must not be able to change the file table. Process creation keeps a
+/// shared borrow until the kernel reports the fork result, synchronizing the
+/// modeled snapshot with the kernel's file-table snapshot.
+pub trait ProcFileSpace: Clone {
     fn lookup_fd(&self, fd: RawFd) -> Option<ChildFile>;
 
     /// Installs a real FD into the child, records it, and answers the
@@ -41,7 +48,7 @@ pub trait ProcFileSpace {
     fn remove_file(&mut self, fd: RawFd) -> Option<ChildFile>;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RangeFileSpace;
 
 impl RangeFileSpace {
@@ -131,9 +138,9 @@ impl ProcFileSpace for RangeFileSpace {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MappedFileSpace {
-    files: HashMap<RawFd, ChildFile>,
+    files: Arc<HashMap<RawFd, ChildFile>>,
 }
 
 impl MappedFileSpace {
@@ -157,7 +164,7 @@ impl ProcFileSpace for MappedFileSpace {
             .add_fd(req, backing, false)
             .map_err(io::Error::from_raw_os_error)?;
 
-        self.files.insert(fd, ChildFile::Real);
+        Arc::make_mut(&mut self.files).insert(fd, ChildFile::Real);
 
         tracker
             .respond(req, fd as i64)
@@ -175,15 +182,14 @@ impl ProcFileSpace for MappedFileSpace {
             .add_fd(req, backing, false)
             .map_err(io::Error::from_raw_os_error)?;
 
+        Arc::make_mut(&mut self.files).insert(fd, ChildFile::Mock(mock));
+
         tracker
             .respond(req, fd as i64)
-            .map_err(io::Error::from_raw_os_error)?;
-
-        self.files.insert(fd, ChildFile::Mock(mock));
-        Ok(())
+            .map_err(io::Error::from_raw_os_error)
     }
-    
+
     fn remove_file(&mut self, fd: RawFd) -> Option<ChildFile> {
-        self.files.remove(&fd)
+        Arc::make_mut(&mut self.files).remove(&fd)
     }
 }

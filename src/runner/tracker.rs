@@ -204,3 +204,9 @@ impl Tracker {
         if rc < 0 { Err(errno::get()) } else { Ok(()) }
     }
 }
+
+impl AsRawFd for Tracker {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}

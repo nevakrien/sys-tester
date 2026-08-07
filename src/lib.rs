@@ -17,13 +17,11 @@ use std::num::NonZero;
 pub type Text = &'static str;
 pub type ErrCode = Option<NonZero<u32>>;
 
-
-
 #[derive(Debug, Clone, Copy)]
 pub enum AtomData {
     Open(Text),
-    Read(u32,Text, usize),//text.len <= size
-    Write(u32,Text, usize), //size <= text.len
+    Read(u32, Text, usize),  //text.len <= size
+    Write(u32, Text, usize), //size <= text.len
     Close(u32),
 
     ///this is used as a way to give collections of atoms names

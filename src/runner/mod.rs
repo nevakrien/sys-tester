@@ -2,12 +2,11 @@
 //!
 //! Seccomp, ptrace, process state, and FD state intentionally remain in this
 //! crate because they cooperate on the same compiled test model.
-pub mod seccomp;
+pub mod spawn;
 
-
-use crate::index::IndexVec;
 use crate::AtomData;
 use crate::graph::DirectedGraph;
+use crate::index::IndexVec;
 use foldhash::HashMapExt;
 
 use crate::CompiledSetup;
@@ -38,17 +37,11 @@ impl AtomReq {
         Some(match *atom {
             AtomData::Open(path) => AtomReq::Open(path),
 
-            AtomData::Read(open, _expected, size) => {
-                AtomReq::Read(MockFd(open), size)
-            }
+            AtomData::Read(open, _expected, size) => AtomReq::Read(MockFd(open), size),
 
-            AtomData::Write(open, text, _size) => {
-                AtomReq::Write(MockFd(open), text)
-            }
+            AtomData::Write(open, text, _size) => AtomReq::Write(MockFd(open), text),
 
-            AtomData::Close(open) => {
-                AtomReq::Close(MockFd(open))
-            }
+            AtomData::Close(open) => AtomReq::Close(MockFd(open)),
 
             AtomData::DebugName(_) => return None,
         })
@@ -66,64 +59,60 @@ pub struct Supervisor<PF: ProcFileSpace> {
     procs: HashMap<libc::pid_t, PF>,
 
     ready_atoms: HashMap<AtomReq, Vec<u32>>,
-    wait_counts: IndexVec<u32,u32>,//MAX for already done
-    info:CompiledSetup,
-
+    wait_counts: IndexVec<u32, u32>, //MAX for already done
+    info: CompiledSetup,
 }
 
 impl<PF: ProcFileSpace> Supervisor<PF> {
-	pub fn new(info:CompiledSetup)->Self {
-		let mut ready_atoms : HashMap<_,Vec<_>> = HashMap::with_capacity(1024);
-		let mut wait_counts = IndexVec::with_capacity(info.atoms.len());
+    pub fn new(info: CompiledSetup) -> Self {
+        let mut ready_atoms: HashMap<_, Vec<_>> = HashMap::with_capacity(1024);
+        let mut wait_counts = IndexVec::with_capacity(info.atoms.len());
 
-		for id in 0..info.atoms.len() {
-			let edges = info.before_graph.full_edges(id as u32);
-			wait_counts.push(edges.len() as u32);
+        for id in 0..info.atoms.len() {
+            let edges = info.before_graph.full_edges(id as u32);
+            wait_counts.push(edges.len() as u32);
 
-			if edges.len() != 0 {
-				continue;
-			}
-			
-			let Some(req)  = AtomReq::new(&info.atoms[id].data) else {
-				todo!("handle logs")
-			};
-			ready_atoms.entry(req).or_default().push(id as u32);
-		}
+            if edges.len() != 0 {
+                continue;
+            }
 
-		Self {
-			buffer: PageBuffer::new(),
-			procs: HashMap::with_capacity(1024),
-			ready_atoms,
-			wait_counts,
-			info
-		}
-	}
+            let Some(req) = AtomReq::new(&info.atoms[id].data) else {
+                todo!("handle logs")
+            };
+            ready_atoms.entry(req).or_default().push(id as u32);
+        }
 
-	pub fn mark_done(&mut self,id:u32){
-		for x in self.info.after_graph.edges(id) {
-			debug_assert!(self.wait_counts[x]>0);
+        Self {
+            buffer: PageBuffer::new(),
+            procs: HashMap::with_capacity(1024),
+            ready_atoms,
+            wait_counts,
+            info,
+        }
+    }
 
-			self.wait_counts[x]-=1;
-			if self.wait_counts[x] == 0 {
-				let Some(req)  = AtomReq::new(&self.info.atoms[x as usize].data) else {
-					todo!("handle logs")
-				};
-				self.ready_atoms.entry(req).or_default().push(x);
-			}
-		}
+    pub fn mark_done(&mut self, id: u32) {
+        for x in self.info.after_graph.edges(id) {
+            debug_assert!(self.wait_counts[x] > 0);
 
-		self.wait_counts[id]=u32::MAX;
-	}
+            self.wait_counts[x] -= 1;
+            if self.wait_counts[x] == 0 {
+                let Some(req) = AtomReq::new(&self.info.atoms[x as usize].data) else {
+                    todo!("handle logs")
+                };
+                self.ready_atoms.entry(req).or_default().push(x);
+            }
+        }
 
-	pub fn iter_undone(&self)->impl Iterator<Item=u32>{
-		self.wait_counts.iter().enumerate().filter_map(|(i,c)|{
-			if *c!=u32::MAX {
-				Some(i as u32)
-			}else{
-				None
-			}
-		})
-	}
+        self.wait_counts[id] = u32::MAX;
+    }
+
+    pub fn iter_undone(&self) -> impl Iterator<Item = u32> {
+        self.wait_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| if *c != u32::MAX { Some(i as u32) } else { None })
+    }
 
     pub fn map_fd(&self, p: libc::pid_t, fd: RawFd) -> Option<ChildFile> {
         self.procs.get(&p)?.lookup_fd(fd)

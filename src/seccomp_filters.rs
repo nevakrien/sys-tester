@@ -50,6 +50,7 @@ pub type SeccompFilter<const LEN: usize> = [libc::sock_filter; LEN];
 pub const X86_64_RANGE_FILE_ONLY: SeccompFilter<{ filter_len!("x86_64_range_file_only.bpf") }> =
     include_filter!("x86_64_range_file_only.bpf");
 
+#[allow(dead_code)]
 pub const X86_64_RANGE_STRICT: SeccompFilter<{ filter_len!("x86_64_range_strict.bpf") }> =
     include_filter!("x86_64_range_strict.bpf");
 

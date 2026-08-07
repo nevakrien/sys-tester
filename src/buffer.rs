@@ -1,5 +1,5 @@
-use std::mem::transmute;
 use std::mem::MaybeUninit;
+use std::mem::transmute;
 use std::ops::{Deref, DerefMut};
 use std::ptr::copy_nonoverlapping;
 use std::{error, fmt, io};

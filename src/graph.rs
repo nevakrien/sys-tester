@@ -84,7 +84,7 @@ impl<Node: Idx> VecGraph<Node> {
         self.edges.len()
     }
 
-    pub fn full_edges(&self, i: Node) -> impl DoubleEndedIterator<Item = Node>+ExactSizeIterator {
+    pub fn full_edges(&self, i: Node) -> impl DoubleEndedIterator<Item = Node> + ExactSizeIterator {
         let r = self.nodes[i].clone();
         self.edges[r.start..r.end].iter().copied()
     }

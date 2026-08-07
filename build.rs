@@ -76,9 +76,10 @@
 //! 7. The launcher calls execve.
 //!
 //! Successful execve replaces the launcher's address space and unshares its FD
-//! table. The helper retains the listener and supervises the executed program.
+//! table. The helper retains the listener long enough to transfer it to the
+//! supervisor with SCM_RIGHTS, then exits.
 //!
-//! No bootstrap filter or SCM_RIGHTS transfer is needed.
+//! No bootstrap filter or post-filter transfer syscall in the target is needed.
 //!
 //! # execve
 //!
@@ -260,7 +261,6 @@ const NONDETERMINISTIC_ENVIRONMENT: &[&str] = &[
     "uname",
     "sysinfo",
     "getrlimit",
-    "prlimit64",
     "getrusage",
 ];
 
@@ -410,6 +410,13 @@ const PROCESS_TOPOLOGY: &[&str] = &["fork", "vfork", "clone", "clone3"];
 /// Alternative execution mechanisms not required by trusted startup.
 const SUPERVISED_EXECUTION: &[&str] = &["execveat"];
 
+/// Broad interfaces whose meaning cannot be classified from one argument.
+///
+/// These require syscall-specific decoding in every supervision mode. In
+/// particular, ioctl behavior depends on both the descriptor type and request,
+/// while prlimit64 is either a query or a mutation depending on its pointers.
+const GENERAL_CASE_OPERATIONS: &[&str] = &["ioctl", "prlimit64"];
+
 /// Readiness APIs whose relevant descriptors cannot be classified by testing
 /// syscall argument zero.
 const POLL_AND_READINESS: &[&str] = &[
@@ -465,8 +472,8 @@ const UNSUPPORTED_ASYNC_IO: &[&str] = &[
 // FD-policy-dependent operations
 // =============================================================================
 
-/// Operations whose policy-relevant descriptor is argument zero.
-const FD_ARG0_OPERATIONS: &[&str] = &[
+/// File-like operations whose policy-relevant descriptor is argument zero.
+const FD_FILE_OPERATIONS: &[&str] = &[
     // Byte I/O.
     "read",
     "write",
@@ -483,9 +490,12 @@ const FD_ARG0_OPERATIONS: &[&str] = &[
     "fsync",
     "fdatasync",
     "ftruncate",
-    // Generic descriptor/device control.
-    "ioctl",
-    // Socket I/O and state.
+    // Descriptor lifetime.
+    "close",
+];
+
+/// Socket operations whose policy-relevant descriptor is argument zero.
+const FD_SOCKET_OPERATIONS: &[&str] = &[
     "sendto",
     "recvfrom",
     "sendmsg",
@@ -497,8 +507,6 @@ const FD_ARG0_OPERATIONS: &[&str] = &[
     "getpeername",
     "getsockopt",
     "setsockopt",
-    // Descriptor lifetime.
-    "close",
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -593,7 +601,18 @@ fn export_filter(path: &Path, policy: Policy) -> Result<(), Box<dyn Error>> {
     // The supervisor decides whether to continue, emulate, or terminate.
 
     add_mmap_rules(&mut context, &mut explicit)?;
-    add_fd_arg0_rules(&mut context, &mut explicit, policy.fd_policy)?;
+    add_fd_arg0_rules(
+        &mut context,
+        &mut explicit,
+        policy.fd_policy,
+        FD_FILE_OPERATIONS,
+    )?;
+    add_fd_arg0_rules(
+        &mut context,
+        &mut explicit,
+        policy.fd_policy,
+        FD_SOCKET_OPERATIONS,
+    )?;
 
     // These arrays intentionally receive no explicit rule because Notify is
     // already the default. Listing them still documents the modeled categories
@@ -606,6 +625,7 @@ fn export_filter(path: &Path, policy: Policy) -> Result<(), Box<dyn Error>> {
             NETWORK_TOPOLOGY,
             PROCESS_TOPOLOGY,
             SUPERVISED_EXECUTION,
+            GENERAL_CASE_OPERATIONS,
             POLL_AND_READINESS,
             SPECIAL_FD_OPERATIONS,
             UNSUPPORTED_ASYNC_IO,
@@ -662,16 +682,17 @@ fn add_fd_arg0_rules(
     context: &mut ScmpFilterContext,
     explicit: &mut HashSet<&'static str>,
     policy: FdPolicy,
+    operations: &'static [&'static str],
 ) -> Result<(), Box<dyn Error>> {
     match policy {
         FdPolicy::AlwaysNotify => {
             // Notify is the default. Register the group only for overlap
             // validation and documentation.
-            register_group(explicit, FD_ARG0_OPERATIONS)?;
+            register_group(explicit, operations)?;
         }
 
         FdPolicy::ReservedRange => {
-            for &name in FD_ARG0_OPERATIONS {
+            for &name in operations {
                 register(explicit, name)?;
 
                 let Some(syscall) = resolve_optional(name) else {

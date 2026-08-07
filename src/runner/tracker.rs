@@ -3,18 +3,12 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use super::errno;
 
 pub struct Tracker {
-    pid: libc::pid_t,
     listener: OwnedFd,
 }
 
 impl Tracker {
-    pub(crate) fn new(pid: libc::pid_t, listener: OwnedFd) -> Self {
-        Self { pid, listener }
-    }
-
-    /// PID of the process that owns the intercepted syscalls.
-    pub fn pid(&self) -> libc::pid_t {
-        self.pid
+    pub(crate) fn new(listener: OwnedFd) -> Self {
+        Self { listener }
     }
 
     /// Block until a seccomp user-notification is available.

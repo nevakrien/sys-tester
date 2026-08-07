@@ -6,12 +6,12 @@
 mod errno;
 mod fd;
 mod request;
-mod socket;
-pub mod spawn;
 mod supervisor;
+pub mod spawn;
+mod tracker;
 
 pub use crate::MockFd;
 pub use fd::{ChildFile, ProcFileSpace};
 pub use request::AtomReq;
-pub use socket::Tracker;
+pub use tracker::Tracker;
 pub use supervisor::Supervisor;

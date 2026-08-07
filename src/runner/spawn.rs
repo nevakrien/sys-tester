@@ -215,6 +215,9 @@ struct TargetArgs {
 /// - the listener FD has been transferred to this supervisor; and
 /// - the temporary spawner has exited.
 ///
+/// On success, returns a `Tracker` for the seccomp notification socket and the
+/// PID of the process that owns the intercepted syscalls.
+///
 /// # Safety
 ///
 /// - `executable` must point to a valid NUL-terminated pathname.
@@ -237,7 +240,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
     stdin: Option<FdFactory<'a>>,
     stdout: Option<FdFactory<'a>>,
     stderr: Option<FdFactory<'a>>,
-) -> Result<Tracker, SpawnError> {
+) -> Result<(Tracker, libc::pid_t), SpawnError> {
     validate_inputs(filter, executable, argv, envp)?;
     exchange.reset();
 
@@ -310,7 +313,7 @@ pub unsafe fn spawn_seccomp_target<'a>(
             return Err(SpawnError::new(StartupStep::CloneTarget, libc::ECHILD));
         }
 
-        Ok(Tracker::new(pid, listener))
+        Ok((Tracker::new(listener), pid))
     })();
 
     if result.is_err() && startup_done {
@@ -783,13 +786,14 @@ mod tests {
         }
         .expect("target startup failed");
         assert_eq!(exchange.shared().done.load(Ordering::Acquire), STARTUP_DONE);
-        let guard = ChildGuard(process.pid());
+        let (mut process, pid) = process;
+        let guard = ChildGuard(pid);
 
         let notification = loop {
             let notification = process
                 .recv()
                 .expect("failed to receive seccomp notification");
-            assert_eq!(notification.pid as libc::pid_t, process.pid());
+            assert_eq!(notification.pid as libc::pid_t, pid);
             if notification.data.nr as libc::c_long == libc::SYS_openat {
                 break notification;
             }

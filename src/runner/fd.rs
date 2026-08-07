@@ -3,8 +3,8 @@ use foldhash::HashMap;
 use std::io;
 use std::os::fd::{BorrowedFd, RawFd};
 
-use crate::runner::Tracker;
 use crate::MockFd;
+use crate::runner::Tracker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildFile {
@@ -18,8 +18,14 @@ pub struct CantAllocate;
 pub trait ProcFileSpace {
     fn lookup_fd(&self, fd: RawFd) -> Option<ChildFile>;
 
-    /// Saves the knowledge that a specified real FD was added.
-    fn record_real(&mut self, fd: RawFd) -> Result<(), CantAllocate>;
+    /// Installs a real FD into the child, records it, and answers the
+    /// intercepted syscall with the child FD.
+    fn respond_real(
+        &mut self,
+        backing: BorrowedFd<'_>,
+        tracker: &Tracker,
+        req: &libc::seccomp_notif,
+    ) -> io::Result<()>;
 
     /// Installs the backing FD for `mock` into the child, records it,
     /// and answers the intercepted syscall with the child FD.
@@ -34,7 +40,6 @@ pub trait ProcFileSpace {
     /// Removes a file from our records.
     fn remove_file(&mut self, fd: RawFd) -> Option<ChildFile>;
 }
-
 
 #[derive(Debug, Default)]
 pub struct RangeFileSpace;
@@ -80,13 +85,26 @@ impl ProcFileSpace for RangeFileSpace {
         }
     }
 
-    fn record_real(&mut self, fd: RawFd) -> Result<(), CantAllocate> {
+    fn respond_real(
+        &mut self,
+        backing: BorrowedFd<'_>,
+        tracker: &Tracker,
+        req: &libc::seccomp_notif,
+    ) -> io::Result<()> {
+        let fd = tracker
+            .add_fd(req, backing, false)
+            .map_err(io::Error::from_raw_os_error)?;
+
         // Real FDs must remain below the range reserved for mocks.
-        if fd < 0 || fd as u64 >= MOCK_FD_BASE {
-            return Err(CantAllocate);
+        if fd as u64 >= MOCK_FD_BASE {
+            return tracker
+                .respond_errno(req, libc::EMFILE)
+                .map_err(io::Error::from_raw_os_error);
         }
 
-        Ok(())
+        tracker
+            .respond(req, fd as i64)
+            .map_err(io::Error::from_raw_os_error)
     }
 
     fn respond_mock(
@@ -96,8 +114,8 @@ impl ProcFileSpace for RangeFileSpace {
         tracker: &Tracker,
         req: &libc::seccomp_notif,
     ) -> io::Result<()> {
-        let target_fd = Self::mock_fd(mock)
-            .map_err(|_| io::Error::from_raw_os_error(libc::EMFILE))?;
+        let target_fd =
+            Self::mock_fd(mock).map_err(|_| io::Error::from_raw_os_error(libc::EMFILE))?;
 
         tracker
             .add_fd_at(req, backing, target_fd, false)
@@ -129,13 +147,21 @@ impl ProcFileSpace for MappedFileSpace {
         self.files.get(&fd).copied()
     }
 
-    fn record_real(&mut self, fd: RawFd) -> Result<(), CantAllocate> {
-        if fd < 0 {
-            return Err(CantAllocate);
-        }
+    fn respond_real(
+        &mut self,
+        backing: BorrowedFd<'_>,
+        tracker: &Tracker,
+        req: &libc::seccomp_notif,
+    ) -> io::Result<()> {
+        let fd = tracker
+            .add_fd(req, backing, false)
+            .map_err(io::Error::from_raw_os_error)?;
 
         self.files.insert(fd, ChildFile::Real);
-        Ok(())
+
+        tracker
+            .respond(req, fd as i64)
+            .map_err(io::Error::from_raw_os_error)
     }
 
     fn respond_mock(
@@ -145,26 +171,18 @@ impl ProcFileSpace for MappedFileSpace {
         tracker: &Tracker,
         req: &libc::seccomp_notif,
     ) -> io::Result<()> {
-        //
-        // Do NOT use add_fd_and_respond here.
-        //
-        // We need to record the mapping before waking the target, otherwise
-        // the target can immediately issue another syscall using the new FD
-        // before `files` contains it.
-        //
         let fd = tracker
             .add_fd(req, backing, false)
             .map_err(io::Error::from_raw_os_error)?;
 
-        if let Err(error) = tracker.respond(req, fd as i64) {
-            return Err(io::Error::from_raw_os_error(error));
-        }
+        tracker
+            .respond(req, fd as i64)
+            .map_err(io::Error::from_raw_os_error)?;
 
         self.files.insert(fd, ChildFile::Mock(mock));
-
         Ok(())
     }
-
+    
     fn remove_file(&mut self, fd: RawFd) -> Option<ChildFile> {
         self.files.remove(&fd)
     }
